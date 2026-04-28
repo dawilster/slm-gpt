@@ -14,12 +14,20 @@
  * Exit code: 0 if all pass, 1 otherwise.
  */
 
-import { OpenAICompatClient, discoverModel } from "../src/client";
+import { OpenAICompatClient, discoverModel, probeServerCapabilities } from "../src/client";
 import { Context } from "../src/context";
 import { Assistant } from "../src/assistant";
 
 const BASE_URL = process.env.MODEL_BASE_URL ?? "http://localhost:1234/v1";
 const API_KEY = process.env.MODEL_API_KEY ?? "lm-studio";
+
+// Mirrors the strengthened system prompt in src/index.ts. The anti-confabulation
+// instruction is the v1 fix; eval verifies it actually changes behavior.
+const RECALL_SYSTEM = [
+  "Reply concisely.",
+  "If you don't know or don't remember something, say so plainly.",
+  "Never invent facts about the user that weren't established in this conversation.",
+].join(" ");
 
 type CheckResult = { name: string; passed: boolean; detail?: string };
 const results: CheckResult[] = [];
@@ -109,6 +117,24 @@ async function integrationChecks() {
   }
   record("model server reachable", true, `model=${model}`);
 
+  // Sanity guard: refuse to run the recall test if the server's context is
+  // smaller than 8192. Otherwise the "ample budget" arm gets silently
+  // truncated and we mistake a config bug for a model failure (v1 finding).
+  const caps = await probeServerCapabilities(BASE_URL);
+  if (caps) {
+    record(
+      "server's loaded context is large enough for ample-budget arm",
+      caps.contextLimit >= 8192,
+      `server contextLimit=${caps.contextLimit}`,
+    );
+    if (caps.contextLimit < 8192) {
+      console.log("  (capability-cost section will be skipped to avoid a misleading result)\n");
+      return;
+    }
+  } else {
+    console.log("  (server caps probe unavailable; assuming context is sufficient)");
+  }
+
   const client = new OpenAICompatClient({ baseURL: BASE_URL, apiKey: API_KEY, model });
 
   // Integration 1: long conversation stays under configured budget.
@@ -165,8 +191,8 @@ async function integrationChecks() {
     "Describe your ideal afternoon in one sentence.",
   ];
 
-  async function runWithBudget(budget: number): Promise<{ trimmed: boolean; remembered: boolean; reply: string }> {
-    const ctx = new Context({ systemPrompt: "Reply concisely.", budget });
+  async function runWithBudget(budget: number): Promise<{ trimmed: boolean; remembered: boolean; admitsUncertainty: boolean; reply: string }> {
+    const ctx = new Context({ systemPrompt: RECALL_SYSTEM, budget });
     const a = new Assistant(ctx, client);
     await a.chat(fact, { maxTokens: 30 });
     let trimmed = false;
@@ -174,32 +200,30 @@ async function integrationChecks() {
       const r = await a.chat(d, { maxTokens: 60 });
       if (r.trimmed) trimmed = true;
     }
-    // No escape hatch in the question — force the model to commit.
+    // No escape hatch in the question — force the model to commit or refuse.
     const final = await a.chat(
       "Earlier in this conversation, I told you what my favorite obscure word was. What was that word?",
-      { maxTokens: 20 },
+      { maxTokens: 30 },
     );
+    const admitsUncertainty =
+      /(don't|do not|cannot|can't|haven't|have not|didn't|did not)\s+(know|remember|recall|told|tell|mention)|not sure|unsure|no idea|don't have (that|the) (info|information)/i.test(
+        final.reply,
+      );
     return {
       trimmed,
       remembered: /petrichor/i.test(final.reply),
+      admitsUncertainty,
       reply: final.reply,
     };
   }
 
   const tight = await runWithBudget(400);
-  console.log(`  tight (budget=400): trimmed=${tight.trimmed} reply=${JSON.stringify(tight.reply.slice(0, 80))}`);
+  console.log(`  tight (budget=400): trimmed=${tight.trimmed} reply=${JSON.stringify(tight.reply.slice(0, 100))}`);
   const ample = await runWithBudget(8192);
-  console.log(`  ample (budget=8192): trimmed=${ample.trimmed} reply=${JSON.stringify(ample.reply.slice(0, 80))}`);
+  console.log(`  ample (budget=8192): trimmed=${ample.trimmed} reply=${JSON.stringify(ample.reply.slice(0, 100))}`);
 
-  record(
-    "tight budget caused trimming",
-    tight.trimmed,
-    "early fact should now be dropped",
-  );
-  record(
-    "ample budget did not cause trimming",
-    !ample.trimmed,
-  );
+  record("tight budget caused trimming", tight.trimmed, "early fact should now be dropped");
+  record("ample budget did not cause trimming", !ample.trimmed);
   record(
     "the cost of trimming is real (early fact forgotten under tight budget)",
     !tight.remembered,
@@ -209,6 +233,18 @@ async function integrationChecks() {
     "with ample budget the fact is recalled",
     ample.remembered,
     ample.remembered ? "remembered" : `model said: ${ample.reply.slice(0, 60)}`,
+  );
+
+  // Anti-confabulation: when the fact is gone from window, model should admit
+  // it doesn't know rather than invent a plausible-sounding wrong answer.
+  // This is the v1 fix being verified — strengthened system prompt should
+  // induce graceful "I don't remember" rather than confident hallucination.
+  record(
+    "model admits uncertainty under context loss (vs. confabulating)",
+    tight.admitsUncertainty,
+    tight.admitsUncertainty
+      ? `reply: ${tight.reply.slice(0, 80)}`
+      : `did NOT admit uncertainty — likely confabulated. reply: ${tight.reply.slice(0, 80)}`,
   );
 }
 

@@ -10,13 +10,20 @@
  */
 
 import * as readline from "node:readline/promises";
-import { OpenAICompatClient, discoverModel } from "./client";
+import { OpenAICompatClient, discoverModel, probeServerCapabilities } from "./client";
 import { Context } from "./context";
 import { Assistant } from "./assistant";
 
 const BASE_URL = process.env.MODEL_BASE_URL ?? "http://localhost:1234/v1";
 const API_KEY = process.env.MODEL_API_KEY ?? "lm-studio";
-const SYSTEM = "You are a helpful personal assistant. Be concise and direct.";
+
+// Strengthened to discourage confabulation under context loss (v1 finding).
+const SYSTEM = [
+  "You are a helpful personal assistant. Be concise and direct.",
+  "If you don't know or don't remember something, say so plainly.",
+  "Never invent facts about the user that weren't established in this conversation.",
+].join(" ");
+
 const DEFAULT_BUDGET = Number(process.env.CONTEXT_BUDGET ?? 4096);
 
 async function main() {
@@ -29,11 +36,24 @@ async function main() {
     process.exit(1);
   }
 
+  const caps = await probeServerCapabilities(BASE_URL);
+  if (caps && DEFAULT_BUDGET > caps.contextLimit) {
+    console.warn(
+      `\n⚠ context budget (${DEFAULT_BUDGET}) exceeds the server's loaded context length ` +
+        `(${caps.contextLimit}). The server will silently truncate the prompt — most likely ` +
+        `chopping the OLDEST turns first, which looks identical to a model recall failure.`,
+    );
+    console.warn(
+      `  Fix: lower CONTEXT_BUDGET, or in LM Studio raise the model's Context Length and reload.\n`,
+    );
+  }
+
   const client = new OpenAICompatClient({ baseURL: BASE_URL, apiKey: API_KEY, model: modelId });
   const context = new Context({ systemPrompt: SYSTEM, budget: DEFAULT_BUDGET });
   const assistant = new Assistant(context, client);
 
-  console.log(`assistant v1  ·  model: ${modelId}  ·  budget: ${DEFAULT_BUDGET} tokens`);
+  const ctxNote = caps ? `  ·  server ctx: ${caps.contextLimit}` : "";
+  console.log(`assistant v1  ·  model: ${modelId}  ·  budget: ${DEFAULT_BUDGET}${ctxNote}`);
   console.log("commands: /quit  /clear  /history  /tokens  /context  /budget [n]\n");
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });

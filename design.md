@@ -129,7 +129,7 @@ What a 3B-class instruct model genuinely struggles with — to be confirmed empi
 | **Negation & quantifiers** | "All X except Y" → handles X, ignores Y | Phrase prompts in positive form |
 | **Following a tool result** | Ignores tool output, repeats the original answer | Explicit "based on the tool result above…" framing |
 | **Refusal vs. attempt** | Tries to answer when it should say "I don't know" | Add explicit "if unsure, say so" to system prompt |
-| **Confabulation under context loss** | When a fact has been evicted from the sliding window, model invents a plausible-sounding wrong answer rather than admitting it doesn't know (observed v1 eval, Qwen-3B: invented "Omniscientophilia" when the original fact "petrichor" had aged out of context) | Pin salient facts; system prompt must instruct refusal on uncertainty; consider summarizing dropped turns rather than discarding |
+| **Confabulation under context loss** | When a fact has been evicted from the sliding window, model invents a plausible-sounding wrong answer rather than admitting it doesn't know (observed v1 eval, Qwen-3B: invented "Omniscientophilia" when "petrichor" had aged out) | **Mitigation verified at 3B scale (v1 post-fix):** explicit "if you don't know, say so plainly" in system prompt flipped reply to a graceful "I don't know what your favorite obscure word is because I wasn't previously told." Pin salient facts and summarize-on-eviction are still on the roadmap. |
 | **Code generation > 30 lines** | Drift, syntax errors, broken imports | Don't use it for this. Tool-call to a coder model if needed. |
 
 We will keep this section updated as we hit specific cliffs.
@@ -245,7 +245,7 @@ Things we don't know yet, and intend to learn:
 10. **Routing:** does the local model's own self-assessment ("I'm not sure about this") correlate with actual answer quality, or is it noise? If correlation is real, we can use it to drive escalation cheaply.
 11. **Routing:** when a request escalates from local to frontier, does the frontier need the original conversation history, or is the latest message + a summary enough? (Cost vs quality tradeoff.)
 12. **Privacy:** what's the right user-facing affordance for "this stays local"? A `:private` tag in notes? A folder? A regex? All three?
-13. **Confabulation:** does adding "if you're not certain, say 'I don't remember'" to the system prompt actually reduce hallucinated recall, or does the 3B model confidently override it? (Empirical question, run the v1 confabulation test with and without the instruction.)
+13. ~~**Confabulation:** does adding "if you're not certain, say 'I don't remember'" to the system prompt actually reduce hallucinated recall?~~ **Answered (v1 eval):** yes, at 3B scale. With the instruction, Qwen-3B admits uncertainty cleanly. Without it, it confabulates. n=1 per arm — would benefit from a sweep, but the binary effect is striking. Open question becomes: how robust is this under prompt-injection or adversarial framing?
 14. **Eval design:** v1 surfaced that subtle eval choices (distractor content, question phrasing) materially change conclusions about model capability. We need a discipline around eval prompts: neutral distractors, no answer-shaped escape hatches, control runs on a frontier model to confirm the test is actually solvable.
 
 ## 8. Decision log
@@ -263,6 +263,8 @@ Architectural choices, with reasons. So future-William remembers why.
 | 2026-04-28 | `ModelClient` interface, not direct SDK use | Routing requires uniform interface across tiers. Introduce abstraction at v3 so v7 is a drop-in addition rather than a refactor. |
 | 2026-04-28 | Tiered routing (local → mid → frontier), local as default | Cost discipline + privacy + latency. Default-local forces every capability to first prove it can't be served cheaply. |
 | 2026-04-28 | Privacy boundary enforced *before* routing | Sensitive content can never reach a hosted tier, regardless of routing pressure. The router asks "is this allowed to leave?" before "where should it go?" |
+| 2026-04-28 | Default system prompt includes anti-confabulation instruction | v1 eval showed Qwen-3B confabulates by default but admits uncertainty when explicitly told to. Cheap mitigation, large behavioral effect. |
+| 2026-04-28 | Probe server's loaded context length at startup; warn if budget exceeds it | v1 surfaced silent prompt truncation (LM Studio at 4096 + budget at 8192 → server chops oldest turns, indistinguishable from a model recall failure). Now we warn at startup and the eval refuses to run if the server can't host the test. |
 
 ## 9. Out of scope (for now)
 

@@ -79,3 +79,41 @@ export async function discoverModel(baseURL: string, apiKey: string): Promise<st
   if (!chat) throw new Error("No chat model loaded at " + baseURL);
   return chat.id;
 }
+
+/**
+ * Server-side capabilities for the *currently loaded* model, when the
+ * server exposes them. LM Studio exposes this via `/api/v0/models`
+ * (separate from the OpenAI-compat `/v1/models`). Other servers may
+ * not — return null cleanly so callers can treat it as best-effort.
+ */
+export type ServerCapabilities = {
+  modelId: string;
+  contextLimit: number;
+  capabilities: string[];
+};
+
+export async function probeServerCapabilities(baseURL: string): Promise<ServerCapabilities | null> {
+  const root = baseURL.replace(/\/v1\/?$/, "");
+  try {
+    const resp = await fetch(`${root}/api/v0/models`, { signal: AbortSignal.timeout(2000) });
+    if (!resp.ok) return null;
+    const data = (await resp.json()) as {
+      data?: Array<{
+        id: string;
+        type?: string;
+        state?: string;
+        loaded_context_length?: number;
+        capabilities?: string[];
+      }>;
+    };
+    const loaded = data.data?.find((m) => m.state === "loaded" && m.type !== "embeddings");
+    if (!loaded?.loaded_context_length) return null;
+    return {
+      modelId: loaded.id,
+      contextLimit: loaded.loaded_context_length,
+      capabilities: loaded.capabilities ?? [],
+    };
+  } catch {
+    return null;
+  }
+}
