@@ -11,6 +11,8 @@
  *   /sessions            list recent saved sessions
  *   /load <id-prefix>    switch to a saved session
  *   /resume              load the most recent session that isn't the current one
+ *   /profile             show stored facts about the user
+ *   /forget <key>        remove a fact from the profile
  *
  * CLI flags:
  *   --resume             start by loading the most recent saved session
@@ -33,22 +35,40 @@ import { SessionStore, type Session } from "./sessions";
 import {
   ToolRegistry,
   getCurrentTimeTool,
+  makeForgetTool,
   makeListNotesTool,
   makeReadNoteTool,
+  makeRememberTool,
   makeSearchNotesByFilenameTool,
   makeWriteNoteTool,
 } from "./tools";
+import { Profile } from "./profile";
 
 const BASE_URL = process.env.MODEL_BASE_URL ?? "http://localhost:1234/v1";
 const API_KEY = process.env.MODEL_API_KEY ?? "lm-studio";
 const ASSISTANT_HOME = process.env.ASSISTANT_HOME ?? join(process.env.HOME ?? "", ".assistant");
 
-// Strengthened to discourage confabulation under context loss (v1 finding).
-const SYSTEM = [
+// Base system prompt. The profile is appended dynamically (see buildSystemPrompt
+// below) so new facts saved via the remember tool appear on the next turn.
+//
+// The memory rules below are deliberately verbose and example-driven. The
+// terse one-liner version ("update facts when they change") missed implicit
+// changes like "I don't like eggs anymore" at 4B scale (v5 eval supersession
+// went 1/3). Explicit example phrases shifted that meaningfully.
+const BASE_SYSTEM = [
   "You are a helpful personal assistant. Be concise and direct.",
   "If you don't know or don't remember something, say so plainly.",
   "Never invent facts about the user that weren't established in this conversation.",
-].join(" ");
+  "Memory rules:",
+  "- When the user states a stable fact about themselves (preference, name, location, relationship), call remember(key, value).",
+  "- When the user signals a change to a known fact — including phrasings like 'I don't like X anymore', 'I now prefer Y', 'I take it Z now', 'actually, I W' — call remember(key, value) with the NEW value to overwrite the old one. Don't just acknowledge verbally; call the tool.",
+  "- Only call forget(key) if the fact no longer applies AND has no replacement.",
+].join("\n");
+
+function buildSystemPrompt(profile: Profile): string {
+  const profileSection = profile.renderForSystemPrompt();
+  return profileSection ? `${BASE_SYSTEM}\n\n${profileSection}` : BASE_SYSTEM;
+}
 
 const DEFAULT_BUDGET = Number(process.env.CONTEXT_BUDGET ?? 4096);
 
@@ -83,14 +103,16 @@ async function main() {
     console.warn(`  Fix: lower CONTEXT_BUDGET, or raise context length in LM Studio and reload.\n`);
   }
 
+  const profile = await Profile.load(join(ASSISTANT_HOME, "profile.json"));
+
   const client = new OpenAICompatClient({ baseURL: BASE_URL, apiKey: API_KEY, model: modelId });
-  const context = new Context({ systemPrompt: SYSTEM, budget: DEFAULT_BUDGET });
+  const context = new Context({ systemPrompt: buildSystemPrompt(profile), budget: DEFAULT_BUDGET });
   const store = new SessionStore(join(ASSISTANT_HOME, "sessions"));
   await store.ensure();
 
-  // Notes folder + tool registry. v4 expands the toolset to 5 tools so we
-  // can stress whether Qwen 3-4B's tool selection holds up beyond the 1-2
-  // tool comfort zone of v3.
+  // Notes folder + tool registry. v5 adds remember/forget for profile facts
+  // (current truth about the user, always loaded into the system prompt) on
+  // top of the v4 note-tools. 7 tools total.
   const notesRoot = join(ASSISTANT_HOME, "notes");
   await mkdir(notesRoot, { recursive: true });
   const registry = new ToolRegistry();
@@ -99,6 +121,8 @@ async function main() {
   registry.register(makeListNotesTool(notesRoot));
   registry.register(makeWriteNoteTool(notesRoot));
   registry.register(makeSearchNotesByFilenameTool(notesRoot));
+  registry.register(makeRememberTool(profile));
+  registry.register(makeForgetTool(profile));
 
   // Decide initial session based on CLI args.
   let session: Session;
@@ -108,10 +132,13 @@ async function main() {
     if (recent) {
       const turns = await store.loadTurns(recent.id);
       context.restore(turns);
+      // Profile is current truth — override whatever system prompt was
+      // persisted with this session at its original creation time.
+      context.setSystemPrompt(buildSystemPrompt(profile));
       session = store.open(recent.id);
       console.log(`resumed session ${recent.id} (${turns.length} turns from ${recent.startedAt})`);
     } else {
-      session = await freshSession(store);
+      session = await freshSession(store, profile);
       console.log(`(no prior session to resume — started new ${session.id})`);
     }
   } else if (mode.kind === "load") {
@@ -122,18 +149,19 @@ async function main() {
     }
     const turns = await store.loadTurns(id);
     context.restore(turns);
+    context.setSystemPrompt(buildSystemPrompt(profile));
     session = store.open(id);
     console.log(`loaded session ${id} (${turns.length} turns)`);
   } else {
-    session = await freshSession(store);
+    session = await freshSession(store, profile);
   }
 
   const assistant = new Assistant(context, client, session, registry);
 
   const ctxNote = caps ? `  ·  server ctx: ${caps.contextLimit}` : "";
-  console.log(`assistant v4  ·  model: ${modelId}  ·  budget: ${DEFAULT_BUDGET}${ctxNote}`);
-  console.log(`session: ${session.id}  ·  tools: ${registry.size()}  ·  notes: ${notesRoot}`);
-  console.log("commands: /quit  /clear  /new  /history  /tokens  /context  /budget [n]  /sessions  /load <id>  /resume  /tools\n");
+  console.log(`assistant v5  ·  model: ${modelId}  ·  budget: ${DEFAULT_BUDGET}${ctxNote}`);
+  console.log(`session: ${session.id}  ·  tools: ${registry.size()}  ·  notes: ${notesRoot}  ·  profile: ${profile.size()} facts`);
+  console.log("commands: /quit  /clear  /new  /history  /tokens  /context  /budget [n]  /sessions  /load <id>  /resume  /tools  /profile  /forget <key>\n");
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
@@ -145,7 +173,10 @@ async function main() {
 
     if (input === "/clear" || input === "/new") {
       context.clear();
-      const fresh = await freshSession(store);
+      // Re-render in case profile changed since startup (e.g. via tool calls
+      // in the previous session). Cheap; correctness is worth it.
+      context.setSystemPrompt(buildSystemPrompt(profile));
+      const fresh = await freshSession(store, profile);
       assistant.setSession(fresh);
       console.log(`[new session ${fresh.id}]\n`);
       continue;
@@ -222,8 +253,39 @@ async function main() {
       }
       const turns = await store.loadTurns(id);
       context.restore(turns);
+      context.setSystemPrompt(buildSystemPrompt(profile));
       assistant.setSession(store.open(id));
       console.log(`  loaded ${id} (${turns.length} turns)\n`);
+      continue;
+    }
+
+    if (input === "/profile") {
+      if (profile.size() === 0) {
+        console.log("  (no facts saved)\n");
+      } else {
+        for (const [k, v] of profile.entries()) {
+          console.log(`  ${k}: ${v}`);
+        }
+        console.log(`  (${profile.size()} facts at ${profile.path})\n`);
+      }
+      continue;
+    }
+
+    if (input.startsWith("/forget")) {
+      const parts = input.split(/\s+/);
+      if (parts.length < 2 || !parts[1]) {
+        console.log("  usage: /forget <key>\n");
+        continue;
+      }
+      const key = parts.slice(1).join(" ");
+      const removed = profile.delete(key);
+      if (!removed) {
+        console.log(`  no fact under '${Profile.normalizeKey(key)}'\n`);
+      } else {
+        await profile.save();
+        context.setSystemPrompt(buildSystemPrompt(profile));
+        console.log(`  forgot '${Profile.normalizeKey(key)}'\n`);
+      }
       continue;
     }
 
@@ -252,10 +314,17 @@ async function main() {
       }
       const turns = await store.loadTurns(candidate.id);
       context.restore(turns);
+      context.setSystemPrompt(buildSystemPrompt(profile));
       assistant.setSession(store.open(candidate.id));
       console.log(`  resumed ${candidate.id} (${turns.length} turns)\n`);
       continue;
     }
+
+    // Refresh the system prompt before each turn so any facts written via
+    // remember/forget on the previous turn become "always known" now. The
+    // model only sees the system prompt at the start of each request, so
+    // updating in-place between requests is the cheapest correct option.
+    context.setSystemPrompt(buildSystemPrompt(profile));
 
     try {
       const r = await assistant.chat(input);
@@ -274,9 +343,11 @@ async function main() {
   rl.close();
 }
 
-async function freshSession(store: SessionStore): Promise<Session> {
+async function freshSession(store: SessionStore, profile: Profile): Promise<Session> {
   const s = store.newSession();
-  await s.append({ role: "system", content: SYSTEM });
+  // Persist the system prompt as it stands now (with current profile facts)
+  // so a future restore reproduces the original conversation faithfully.
+  await s.append({ role: "system", content: buildSystemPrompt(profile) });
   return s;
 }
 

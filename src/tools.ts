@@ -10,6 +10,7 @@
 
 import { readdir } from "node:fs/promises";
 import { normalize, resolve } from "node:path";
+import { Profile } from "./profile";
 
 export type ToolDefinition = {
   name: string;
@@ -257,6 +258,77 @@ export function makeSearchNotesByFilenameTool(notesRoot: string): Tool {
       } catch (e: any) {
         return `Error: could not search notes: ${e?.message ?? e}`;
       }
+    },
+  };
+}
+
+/**
+ * remember(key, value) — write a stable fact about the user to the profile.
+ *
+ * Writes are auto-saved. Returns a confirmation that mentions the prior
+ * value when overwriting, so the model has signal that an update happened
+ * vs. a new entry was created.
+ *
+ * The profile is rendered into the system prompt at the start of each
+ * user turn (see src/index.ts), so a fact written this turn becomes
+ * "always known" on the next turn without needing a separate lookup tool.
+ */
+export function makeRememberTool(profile: Profile): Tool {
+  return {
+    definition: {
+      name: "remember",
+      description:
+        "Save a stable fact about the user (preferences, relationships, places). Overwrites any prior value for the same key.",
+      parameters: {
+        type: "object",
+        properties: {
+          key: { type: "string", description: "Short label, e.g., 'dog name', 'eggs', 'home'." },
+          value: { type: "string", description: "The fact's value, e.g., 'Buddy', 'dislike', 'Cairns'." },
+        },
+        required: ["key", "value"],
+      },
+    },
+    execute: async (args) => {
+      const k = Profile.validateKey(args.key);
+      if (!k.ok) return `Error: ${k.error}`;
+      const v = Profile.validateValue(args.value);
+      if (!v.ok) return `Error: ${v.error}`;
+      const r = profile.set(k.key, v.value);
+      await profile.save();
+      if (r.prev !== undefined && r.prev !== r.value) {
+        return `Saved '${r.key}: ${r.value}' (overwrote '${r.prev}').`;
+      }
+      return `Saved '${r.key}: ${r.value}'.`;
+    },
+  };
+}
+
+/**
+ * forget(key) — remove a fact from the profile. Useful when the user
+ * tells the assistant a previously-saved fact no longer applies and
+ * has no replacement (otherwise prefer remember(...) to overwrite).
+ */
+export function makeForgetTool(profile: Profile): Tool {
+  return {
+    definition: {
+      name: "forget",
+      description: "Remove a fact from the user's profile by key.",
+      parameters: {
+        type: "object",
+        properties: {
+          key: { type: "string", description: "The key to forget, e.g., 'eggs'." },
+        },
+        required: ["key"],
+      },
+    },
+    execute: async (args) => {
+      const k = Profile.validateKey(args.key);
+      if (!k.ok) return `Error: ${k.error}`;
+      const normalized = Profile.normalizeKey(k.key);
+      const removed = profile.delete(normalized);
+      if (!removed) return `No fact under '${normalized}' — nothing to forget.`;
+      await profile.save();
+      return `Forgot '${normalized}'.`;
     },
   };
 }

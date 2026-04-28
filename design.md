@@ -106,11 +106,12 @@ Each version introduces exactly one new mental model. We do not advance until th
 | **v2** | ✅ shipped | Persistence | Save/load conversations to disk | Session memory vs long-term memory; restart safety |
 | **v3** | ✅ shipped | One tool (two, actually) | Tool schema, model decision, execution, result injection, validate-and-retry | The mechanics of an agent loop; the cost of dated models |
 | **v4** | ✅ shipped | Multi-tool routing | 3–5 tools, tool selection, error handling | The capacity ceiling — how many tools before quality collapses |
-| **v5** | next | Local RAG | Embeddings, vector store, retrieval before generation | Retrieval-augmented generation; "knowing about X" vs "remembering X" |
-| **v6** | future | Web search | External tool, fetch + parse + summarize | Live data, source citation, latency |
-| **v7** | future | Model routing | Add a second tier (mid or frontier), `ModelClient` abstraction, routing policy, cost/latency logs | When to escalate, what the privacy boundary buys, the cost/quality/latency triangle |
-| **v8** | future | Scheduling / background | Cron-style triggers, notifications, persistent agent loop | The assistant runs even when I'm not looking |
-| **v9+** | future | Channels | Adapters for iMessage, Slack, etc. | The OpenClaw shape |
+| **v5** | ✅ shipped | Profile (current truth) | Mutable key→value facts loaded into every system prompt; remember/forget tools | Separate facts from episodes; supersession at write-time, not retrieval-time |
+| **v6** | next | Local RAG (episodic) | Embeddings, vector store, retrieval over notes + past sessions | Retrieval-augmented generation; "knowing about X" vs "remembering X" |
+| **v7** | future | Web search | External tool, fetch + parse + summarize | Live data, source citation, latency |
+| **v8** | future | Model routing | Add a second tier (mid or frontier), `ModelClient` abstraction, routing policy, cost/latency logs | When to escalate, what the privacy boundary buys, the cost/quality/latency triangle |
+| **v9** | future | Scheduling / background | Cron-style triggers, notifications, persistent agent loop | The assistant runs even when I'm not looking |
+| **v10+** | future | Channels | Adapters for iMessage, Slack, etc. | The OpenClaw shape |
 
 **Running what's shipped:**
 
@@ -129,6 +130,7 @@ bun run eval/v1.ts   # context management
 bun run eval/v2.ts   # persistence (kill → reload → recall)
 bun run eval/v3.ts   # tool calling (registry, dispatch, agent loop)
 bun run eval/v4.ts   # multi-tool routing (5 tools, selection + arg validity)
+bun run eval/v5.ts   # profile (write, recall, supersession)
 ```
 
 Notes folder: `~/.assistant/notes/*.md` — drop markdown files there and the assistant can `read_note` them. Sessions live at `~/.assistant/sessions/`.
@@ -155,6 +157,8 @@ What a 3B-class instruct model genuinely struggles with — to be confirmed empi
 | ~~**Discrimination (over-calling)**~~ | Qwen 2.5-3B reflexively called `get_current_time` for unrelated prompts ("What's 2+2?", "Make up a haiku") — 1/5 correct skip rate. | **Resolved at v3 by Qwen 3-4B.** Discrimination went 1/5 → 5/5. Confirmed at v4 with 5 tools active: still 5/5 — over-call bias did not return when the toolset grew. |
 | **Hallucinated tool names** | Qwen 2.5 occasionally emitted tool calls with names that don't exist (e.g., `function`, `suggest_farmers_market_activity`). Hermes-3-3B leaked its native tool format (`[TOOL_RESULT...`) into user-visible text. | **Mitigated by validate-and-retry** (v3.5): unknown tool names produce a tool-result error that lists actual available tools, giving the model a chance to retry on the next loop iteration. Largely a non-issue on Qwen 3-4B regardless. |
 | **Code generation > 30 lines** | Drift, syntax errors, broken imports | Don't use it for this. Tool-call to a coder model if needed. |
+| **Implicit change detection** | "I don't like eggs anymore" / "I changed my mind about X" — model often replies conversationally without calling `remember(...)` to update the profile. (v5 supersession: 1/3 with terse prompt, 2/3 with example-driven prompt.) | Use explicit-replacement phrasing in prompts when *correctness* matters: "My X is now Y, not Z" lands reliably. For UX, document this so users learn to phrase updates explicitly (see README). |
+| **Profile-vs-recent-chat contradiction resolution** | When chat history says "I love eggs" and profile says "dislike", the model often sides with the recent chat. The "right" answer is genuinely ambiguous — real fix is "ask the user", which the model won't do reliably. | Track but don't gate (v5 override category). Document workaround in README ("if you mean a profile fact to be authoritative, restate it"). Real fix when v8 introduces a tier that *does* handle ambiguity well. |
 
 We will keep this section updated as we hit specific cliffs.
 
@@ -178,10 +182,11 @@ Each version ships with a defined "done" — concrete, measurable, automatable.
 | v2 | Kill brain mid-conversation, restart, prior context reloaded correctly |
 | v3 | Single-tool test set: 20 prompts, ≥ 16 produce a valid tool call with correct args |
 | v4 | Multi-tool test set: 30 prompts across 4 tools, ≥ 22 pick the right tool with valid args |
-| v5 | RAG test set: 30 questions over a known corpus, ≥ 24 retrieve a relevant passage AND incorporate it into the answer |
-| v6 | Web-search test set: 20 current-events questions, ≥ 14 produce a sourced, accurate answer |
-| v7 | Routing test set: 40 prompts hand-labeled with the correct tier; router picks correctly ≥ 32. Privacy regex is respected on 100% of synthetic sensitive prompts (zero leaks). Cost log is accurate to within 5%. |
-| v8 | Scheduled task fires on time, completes, and notifies; no zombie processes after restart |
+| v5 | Profile: write 5/5, recall 5/5, supersession ≥2/3. Override (profile vs. recent-chat contradiction) tracked but ungated — inherently ambiguous. |
+| v6 | RAG test set: 30 questions over a known corpus, ≥ 24 retrieve a relevant passage AND incorporate it into the answer |
+| v7 | Web-search test set: 20 current-events questions, ≥ 14 produce a sourced, accurate answer |
+| v8 | Routing test set: 40 prompts hand-labeled with the correct tier; router picks correctly ≥ 32. Privacy regex is respected on 100% of synthetic sensitive prompts (zero leaks). Cost log is accurate to within 5%. |
+| v9 | Scheduled task fires on time, completes, and notifies; no zombie processes after restart |
 
 ### 6.2 Frontier-as-judge
 
@@ -271,6 +276,11 @@ Things we don't know yet, and intend to learn:
 12. **Privacy:** what's the right user-facing affordance for "this stays local"? A `:private` tag in notes? A folder? A regex? All three?
 13. ~~**Confabulation:** does adding "if you're not certain, say 'I don't remember'" to the system prompt actually reduce hallucinated recall?~~ **Answered (v1 eval):** yes, at 3B scale. With the instruction, Qwen-3B admits uncertainty cleanly. Without it, it confabulates. n=1 per arm — would benefit from a sweep, but the binary effect is striking. Open question becomes: how robust is this under prompt-injection or adversarial framing?
 14. **Eval design:** v1 surfaced that subtle eval choices (distractor content, question phrasing) materially change conclusions about model capability. We need a discipline around eval prompts: neutral distractors, no answer-shaped escape hatches, control runs on a frontier model to confirm the test is actually solvable.
+15. **Proactive memory (deferred from v5):** today the profile only updates when the user explicitly says "remember X" or uses replacement phrasing ("X is now Y"). Casual self-descriptions ("I'm a vegetarian", "my dog is Buddy") aren't reliably auto-saved. Three candidate paths:
+    - **Real-time auto-save** — strengthen the system prompt to push the model toward saving stable-sounding facts on its own. Risk: false positives at 4B (in-game pretending, hypotheticals, jokes mistaken for facts).
+    - **Offline grooming** — periodically scan past sessions + notes with a frontier (or local) model, extract candidate facts, surface for user approval. Lower per-turn latency; precision improvable; **shares infrastructure with v6 RAG** (same retrieval over the same corpus).
+    - **Hybrid** — auto-save with visible surfacing ("(saved: X)") so the user can `/forget` mistakes cheaply. Asymmetric error cost reduced.
+    Working hypothesis: offline grooming is the right primary lever — it leverages v6 RAG infrastructure and avoids the per-turn precision tax. Revisit empirically after v6 lands.
 
 ## 8. Decision log
 
@@ -297,6 +307,10 @@ Architectural choices, with reasons. So future-William remembers why.
 | 2026-04-28 | Constrained decoding deferred (not adopted at v3) | Identified by an external consultation as the production-grade primitive for guaranteed schema adherence (GBNF in llama.cpp, Outlines, XGrammar). For our MLX-based stack, support is patchy. With Qwen 3-4B's empirical reliability, the immediate need disappeared. Reconsider when v7 routing introduces a llama.cpp-served tier where GBNF is native. |
 | 2026-04-28 | v4 ships with 5 tools, not 4, despite the pass condition naming "4 tools" | The pass condition (≥22/30) was a hedge; the underlying goal is "stress tool selection past the v3 comfort zone." Five tools (`get_current_time`, `read_note`, `list_notes`, `write_note`, `search_notes_by_filename`) give a stronger signal — and three of them (`read_note`, `list_notes`, `search_notes_by_filename`) deliberately overlap semantically, which is the routing failure mode the eval is meant to surface. Result: 30/30 + clean control + clean 2-step composition. |
 | 2026-04-28 | Path-safety helper factored out of `read_note` once 3 callers needed it | Three is the threshold for DRY; below that, duplication is cheaper than a helper. With `read_note`, `write_note`, and (implicitly via filesystem ops) the others all needing the same parent-traversal / absolute-path / escape checks, the helper finally pays for itself. |
+| 2026-04-28 | v5 = profile (mutable facts), v6 = RAG (was v5) | The "knows me" goal in §1 is closer to "stable preferences across sessions" than "retrieve passages from the corpus". Profile is ~50 lines of code with no infra; RAG would need embeddings + a vector store. Profile-first captures the higher-impact win sooner *and* de-risks RAG (you build retrieval over an episode store you've already accepted is historical, not over a corpus you're trying to extract current-truth from). The supersession problem is solved at write-time (overwrite) instead of retrieval-time (temporal reasoning) — which is the part a 4B model can't reliably do. |
+| 2026-04-28 | Profile is a flat key→value JSON file, rendered into the system prompt at the start of each user turn | Three alternatives considered: (a) sectioned markdown — nice for hand-editing, but tools doing markdown surgery is gnarly. (b) free-form text appended to system prompt by the model itself — model is unreliable at maintaining structure. (c) flat KV with normalize-on-write — wins on simplicity. Keys are lowercased + whitespace-collapsed so "Dog Name" and "dog  name" don't double-enter. The system prompt is rebuilt before every chat turn so newly-saved facts surface immediately. |
+| 2026-04-28 | v5 system prompt is verbose (memory rules + examples) where v0–v4 prompts were terse | Tested empirically: the terse one-liner ("update facts when they change") missed implicit changes like "I don't like eggs anymore" — supersession was 1/3. Adding example phrases ("'I don't like X anymore', 'I now prefer Y', 'actually, I W'") brought it to 2/3. The general rule "small models cope better with terse prompts" still holds, but instruction-shaped text *with examples* is an exception worth paying for when the failure mode is discrimination, not generation. |
+| 2026-04-28 | v5 override category (profile beats recent-chat contradiction) is tracked but ungated | The test setup ("user said in chat history they love eggs, but profile says dislike — what does the model say?") is *inherently* ambiguous: in real use, the right answer is "ask which is current". A 4B model won't do that, and forcing a binary right-or-wrong on an ambiguous case would teach the eval to lie. We log the result for visibility and don't fail the build on it. The honest correctness bar is "model handles the *current-turn* supersession case" (the gated supersession category), not "model resolves history-vs-profile contradictions". |
 
 ## 9. Out of scope (for now)
 
