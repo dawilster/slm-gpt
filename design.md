@@ -99,18 +99,38 @@ We'll start with explicit override + static rules (v7), and add confidence-based
 
 Each version introduces exactly one new mental model. We do not advance until the previous one is felt.
 
-| v | Concept | What we add | What we learn |
-|---|---|---|---|
-| **v0** | Bare chat loop | Basic loop, token telemetry | Models are stateless; we ship the entire conversation each turn |
-| **v1** | Context management | Token budget, sliding window, summarization | Context is a resource, not a free buffet |
-| **v2** | Persistence | Save/load conversations to disk | Session memory vs long-term memory; restart safety |
-| **v3** | One tool | Tool schema, model decision, execution, result injection | The mechanics of an agent loop |
-| **v4** | Multi-tool routing | 3–5 tools, tool selection, error handling | The capacity ceiling — how many tools before quality collapses |
-| **v5** | Local RAG | Embeddings, vector store, retrieval before generation | Retrieval-augmented generation; "knowing about X" vs "remembering X" |
-| **v6** | Web search | External tool, fetch + parse + summarize | Live data, source citation, latency |
-| **v7** | Model routing | Add a second tier (mid or frontier), `ModelClient` abstraction, routing policy, cost/latency logs | When to escalate, what the privacy boundary buys, the cost/quality/latency triangle |
-| **v8** | Scheduling / background | Cron-style triggers, notifications, persistent agent loop | The assistant runs even when I'm not looking |
-| **v9+** | Channels | Adapters for iMessage, Slack, etc. | The OpenClaw shape |
+| v | Status | Concept | What we add | What we learn |
+|---|---|---|---|---|
+| **v0** | ✅ shipped | Bare chat loop | Basic loop, token telemetry | Models are stateless; we ship the entire conversation each turn |
+| **v1** | ✅ shipped | Context management | Token budget, sliding window, summarization | Context is a resource, not a free buffet |
+| **v2** | ✅ shipped | Persistence | Save/load conversations to disk | Session memory vs long-term memory; restart safety |
+| **v3** | ✅ shipped | One tool (two, actually) | Tool schema, model decision, execution, result injection, validate-and-retry | The mechanics of an agent loop; the cost of dated models |
+| **v4** | next | Multi-tool routing | 3–5 tools, tool selection, error handling | The capacity ceiling — how many tools before quality collapses |
+| **v5** | future | Local RAG | Embeddings, vector store, retrieval before generation | Retrieval-augmented generation; "knowing about X" vs "remembering X" |
+| **v6** | future | Web search | External tool, fetch + parse + summarize | Live data, source citation, latency |
+| **v7** | future | Model routing | Add a second tier (mid or frontier), `ModelClient` abstraction, routing policy, cost/latency logs | When to escalate, what the privacy boundary buys, the cost/quality/latency triangle |
+| **v8** | future | Scheduling / background | Cron-style triggers, notifications, persistent agent loop | The assistant runs even when I'm not looking |
+| **v9+** | future | Channels | Adapters for iMessage, Slack, etc. | The OpenClaw shape |
+
+**Running what's shipped:**
+
+```bash
+bun run src/index.ts                     # new session
+bun run src/index.ts --resume            # load the most recent session
+bun run src/index.ts --load <id-prefix>  # load a specific session
+
+# slash commands inside the REPL:
+/quit /clear /new /history /tokens /context /budget [n]
+/sessions /load <id> /resume /tools
+
+# evals:
+bun run eval/v0.ts   # substrate (latency, statelessness, token growth)
+bun run eval/v1.ts   # context management
+bun run eval/v2.ts   # persistence (kill → reload → recall)
+bun run eval/v3.ts   # tool calling (registry, dispatch, agent loop)
+```
+
+Notes folder: `~/.assistant/notes/*.md` — drop markdown files there and the assistant can `read_note` them. Sessions live at `~/.assistant/sessions/`.
 
 **Note on the `ModelClient` abstraction:** even though "real" routing lands at v7, the interface should appear earlier — probably v3, when we first introduce structured tool calls. The brain calls `client.chat.completions.create(...)` against a typed wrapper, not directly against the OpenAI SDK. That way v7 is "add a second `ModelClient` and a router that picks one," not a refactor.
 
