@@ -281,6 +281,12 @@ Things we don't know yet, and intend to learn:
     - **Offline grooming** — periodically scan past sessions + notes with a frontier (or local) model, extract candidate facts, surface for user approval. Lower per-turn latency; precision improvable; **shares infrastructure with v6 RAG** (same retrieval over the same corpus).
     - **Hybrid** — auto-save with visible surfacing ("(saved: X)") so the user can `/forget` mistakes cheaply. Asymmetric error cost reduced.
     Working hypothesis: offline grooming is the right primary lever — it leverages v6 RAG infrastructure and avoids the per-turn precision tax. Revisit empirically after v6 lands.
+16. **Qwen 3 Thinking as a local mid-tier?** Same family, same RAM footprint (~2.4GB at 4-bit), but post-trained to emit `<think>...</think>` reasoning before its answer. Plausibly addresses our known weak spots: v5 supersession 2/3, v5 override 0-1/2, anticipated v6 cross-chunk synthesis, multi-hop tool composition. Costs: 5-10x latency on ambient turns (the model thinks even when nothing needs thinking), bigger maxTokens budgets, a `<think>` strip pass in the client wrapper, and re-validation of every prior eval. Four strategies considered:
+    - **A. Switch wholesale.** Probably not — mid-trajectory model swaps lose hard-won baselines.
+    - **B. Empirical probe.** ~1 hour: run v3/v4/v5 evals against Qwen3-4B-Thinking-2507 to see if accuracy lifts on supersession and override are worth the latency penalty. Cheap data, no commitment.
+    - **C. Use it as the local mid-tier in v8 routing.** A thinking model that never leaves the laptop is actually the most interesting "mid tier" the routing design could hit — keeps the privacy boundary intact while still escalating beyond Instruct on hard prompts. Falls cleanly out of the trajectory.
+    - **D. Reserve it for offline grooming.** Background passes over sessions/notes (proactive profile saves, summary generation, fact extraction) are exactly the workload reasoning models earn their keep on. Avoids the per-turn latency tax entirely. Pairs naturally with question #15.
+    Working hypothesis: **C + D** is the right shape — Thinking is the on-architecture answer to "how do we escalate beyond Instruct without leaving the laptop?", and grooming is the workload where reasoning pays off without the latency tax. B is the cheap probe that would harden this hypothesis. Revisit when v6 RAG lands and v8 routing becomes the next architectural concern.
 
 ## 8. Decision log
 

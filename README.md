@@ -2,7 +2,7 @@
 
 A local-first personal assistant. Brain is **Qwen 3-4B-Instruct-2507** (4-bit MLX, ~2.4GB) served by LM Studio. ~20 tok/s on an M1 with 8GB RAM.
 
-For the architecture, the version trajectory, and the decision log, see [`design.md`](./design.md).
+For the architecture, the version trajectory, and the decision log, see [`design.md`](./design.md). For a visual map, see [`architecture.svg`](./architecture.svg).
 
 ## Quick start
 
@@ -36,7 +36,8 @@ State lives at `~/.assistant/`:
 These are empirical findings from the per-version evals. Knowing them changes how you should phrase things.
 
 ### What works well
-- **Tool calling at 5 tools.** v4 eval: 30/30 right tool with valid args, 5/5 correctly skip-tool on chitchat. The over-call bias from older Qwen 2.5 is gone.
+- **Tool calling at 7 tools.** v4 eval (5 tools): 30/30 right tool with valid args, 5/5 correctly skip-tool on chitchat. The over-call bias from older Qwen 2.5 is gone. v5 added 2 more (`remember`, `forget`) without regression.
+- **Tool calls are visible.** The REPL prints `· tool_name(args) → result preview [Nms · step N]` after each tool execution, so multi-step flows aren't a black box. Errors get a `✗` prefix.
 - **Profile recall.** Facts in `~/.assistant/profile.json` are surfaced into the system prompt every turn. v5 eval: 5/5 — "what's my dog's name?" works without any tool call when the fact is in the profile.
 - **Saving facts when told.** "Remember X is Y" reliably triggers `remember(...)`. v5 write: 5/5.
 - **Anti-confabulation.** With the prompt clause "if you don't know, say so plainly", the model gracefully admits ignorance instead of inventing answers. (Observed cliff in v1 with old Qwen 2.5; resolved.)

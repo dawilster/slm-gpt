@@ -35,6 +35,26 @@ export type TurnResult = {
   toolCallsExecuted: number;
 };
 
+/**
+ * Observability hook fired after each tool execution. Lets callers (REPL,
+ * dev UI, structured logger) surface which tools the model is actually
+ * calling without forcing the assistant to know about IO. The eval suites
+ * leave this unset so test stdout stays clean.
+ */
+export type ToolCallObserver = (info: {
+  step: number;
+  name: string;
+  args: Record<string, unknown> | null;
+  result: string;
+  latencyMs: number;
+  isError: boolean;
+}) => void;
+
+export type ChatOptions = CompletionOptions & {
+  maxSteps?: number;
+  onToolCall?: ToolCallObserver;
+};
+
 const DEFAULT_MAX_STEPS = 5;
 
 export class Assistant {
@@ -57,7 +77,7 @@ export class Assistant {
     return this.session?.id ?? null;
   }
 
-  async chat(userText: string, options: CompletionOptions & { maxSteps?: number } = {}): Promise<TurnResult> {
+  async chat(userText: string, options: ChatOptions = {}): Promise<TurnResult> {
     const maxSteps = options.maxSteps ?? DEFAULT_MAX_STEPS;
     const tools = this.registry && this.registry.size() > 0 ? this.registry.definitions() : undefined;
 
@@ -99,13 +119,39 @@ export class Assistant {
 
         for (const tc of result.toolCalls) {
           toolCallsExecuted++;
+          const start = Date.now();
           const toolResult = await this.executeToolCall(tc);
+          const elapsed = Date.now() - start;
           this.context.addToolResult(tc.id, toolResult);
           await this.persistTurn({
             role: "tool",
             content: toolResult,
             toolCallId: tc.id,
           });
+          if (options.onToolCall) {
+            // Parse args defensively — the model can produce malformed JSON
+            // and we still want to surface that to the observer (as null).
+            let parsedArgs: Record<string, unknown> | null = {};
+            const raw = tc.function.arguments;
+            if (raw && raw.length > 0) {
+              try {
+                const p = JSON.parse(raw);
+                parsedArgs = (typeof p === "object" && p !== null && !Array.isArray(p))
+                  ? (p as Record<string, unknown>)
+                  : null;
+              } catch {
+                parsedArgs = null;
+              }
+            }
+            options.onToolCall({
+              step: steps,
+              name: tc.function.name,
+              args: parsedArgs,
+              result: toolResult,
+              latencyMs: elapsed,
+              isError: toolResult.startsWith("Error"),
+            });
+          }
         }
         continue;
       }

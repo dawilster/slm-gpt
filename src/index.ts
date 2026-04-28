@@ -327,7 +327,7 @@ async function main() {
     context.setSystemPrompt(buildSystemPrompt(profile));
 
     try {
-      const r = await assistant.chat(input);
+      const r = await assistant.chat(input, { onToolCall: printToolCall });
       console.log(`\nassistant: ${r.reply}`);
       const trimNote = r.trimmed ? `  ⚠ trimmed: sent ${r.sentMessages} of ${r.totalMessages}` : "";
       const toolNote = r.toolCallsExecuted > 0 ? `  tools=${r.toolCallsExecuted}  steps=${r.steps}` : "";
@@ -349,6 +349,43 @@ async function freshSession(store: SessionStore, profile: Profile): Promise<Sess
   // so a future restore reproduces the original conversation faithfully.
   await s.append({ role: "system", content: buildSystemPrompt(profile) });
   return s;
+}
+
+/**
+ * REPL-side tool-call observer. Prints one line per tool execution as it
+ * happens, between the user's input and the model's final reply. Without
+ * this, multi-step tool flows (list_notes → read_note → reply) were
+ * invisible — you'd see only the final synthesis with no idea what the
+ * model actually did to get there.
+ *
+ * Args are abbreviated: object keys/values are truncated to ~60 chars to
+ * keep the line scannable. Errors get a different prefix so they jump out.
+ */
+function printToolCall(info: {
+  step: number;
+  name: string;
+  args: Record<string, unknown> | null;
+  result: string;
+  latencyMs: number;
+  isError: boolean;
+}): void {
+  const argsStr = info.args === null
+    ? "<malformed args>"
+    : Object.keys(info.args).length === 0
+    ? ""
+    : Object.entries(info.args)
+        .map(([k, v]) => {
+          const s = typeof v === "string" ? v : JSON.stringify(v);
+          const trimmed = s.length > 40 ? s.slice(0, 40) + "…" : s;
+          return `${k}: ${trimmed}`;
+        })
+        .join(", ");
+  const resultPreview = info.result
+    .replace(/\n/g, " ")
+    .slice(0, 70);
+  const truncated = info.result.length > 70 ? "…" : "";
+  const prefix = info.isError ? "  ✗" : "  ·";
+  console.log(`${prefix} ${info.name}(${argsStr}) → ${resultPreview}${truncated}  [${info.latencyMs}ms · step ${info.step}]`);
 }
 
 main();
