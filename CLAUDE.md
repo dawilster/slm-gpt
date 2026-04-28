@@ -1,3 +1,8 @@
+## Project context
+
+This repo is a personal-assistant-on-local-SLMs project. The plan, the trajectory (v0–v9+), the per-version pass conditions, the decision log, and the open questions all live in `design.md`. Read it before starting work on a version — every architectural choice has a reason there, and the trajectory column tells you what's shipped vs. what's next. Update `design.md` as decisions are made, versions ship, or new failure modes surface.
+
+## Bun
 
 Default to using Bun instead of Node.js.
 

@@ -30,7 +30,14 @@ import { OpenAICompatClient, discoverModel, probeServerCapabilities } from "./cl
 import { Context } from "./context";
 import { Assistant } from "./assistant";
 import { SessionStore, type Session } from "./sessions";
-import { ToolRegistry, getCurrentTimeTool, makeReadNoteTool } from "./tools";
+import {
+  ToolRegistry,
+  getCurrentTimeTool,
+  makeListNotesTool,
+  makeReadNoteTool,
+  makeSearchNotesByFilenameTool,
+  makeWriteNoteTool,
+} from "./tools";
 
 const BASE_URL = process.env.MODEL_BASE_URL ?? "http://localhost:1234/v1";
 const API_KEY = process.env.MODEL_API_KEY ?? "lm-studio";
@@ -81,13 +88,17 @@ async function main() {
   const store = new SessionStore(join(ASSISTANT_HOME, "sessions"));
   await store.ensure();
 
-  // Notes folder + tool registry. Both tools are always available — v3
-  // is "the agent loop works", v4 is where multi-tool routing gets stressed.
+  // Notes folder + tool registry. v4 expands the toolset to 5 tools so we
+  // can stress whether Qwen 3-4B's tool selection holds up beyond the 1-2
+  // tool comfort zone of v3.
   const notesRoot = join(ASSISTANT_HOME, "notes");
   await mkdir(notesRoot, { recursive: true });
   const registry = new ToolRegistry();
   registry.register(getCurrentTimeTool);
   registry.register(makeReadNoteTool(notesRoot));
+  registry.register(makeListNotesTool(notesRoot));
+  registry.register(makeWriteNoteTool(notesRoot));
+  registry.register(makeSearchNotesByFilenameTool(notesRoot));
 
   // Decide initial session based on CLI args.
   let session: Session;
@@ -120,7 +131,7 @@ async function main() {
   const assistant = new Assistant(context, client, session, registry);
 
   const ctxNote = caps ? `  ·  server ctx: ${caps.contextLimit}` : "";
-  console.log(`assistant v3  ·  model: ${modelId}  ·  budget: ${DEFAULT_BUDGET}${ctxNote}`);
+  console.log(`assistant v4  ·  model: ${modelId}  ·  budget: ${DEFAULT_BUDGET}${ctxNote}`);
   console.log(`session: ${session.id}  ·  tools: ${registry.size()}  ·  notes: ${notesRoot}`);
   console.log("commands: /quit  /clear  /new  /history  /tokens  /context  /budget [n]  /sessions  /load <id>  /resume  /tools\n");
 

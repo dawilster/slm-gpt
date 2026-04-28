@@ -8,7 +8,8 @@
  * gets shipped to the model alongside each chat completion request.
  */
 
-import { join, normalize, resolve } from "node:path";
+import { readdir } from "node:fs/promises";
+import { normalize, resolve } from "node:path";
 
 export type ToolDefinition = {
   name: string;
@@ -110,11 +111,27 @@ export const getCurrentTimeTool: Tool = {
 };
 
 /**
+ * Resolve a user-supplied filename against the notes root, refusing
+ * parent traversal, absolute paths, and any resolved path that escapes
+ * the root. Returns the absolute filesystem path on success or an error
+ * message string on rejection. Used by every notes-touching tool.
+ */
+function resolveNotePath(root: string, path: unknown): { ok: true; full: string } | { ok: false; error: string } {
+  if (typeof path !== "string" || path.length === 0) {
+    return { ok: false, error: "Error: 'path' argument is required and must be a non-empty string." };
+  }
+  if (path.includes("..") || path.startsWith("/")) {
+    return { ok: false, error: "Error: path must be a filename within the notes folder, not a parent or absolute path." };
+  }
+  const full = resolve(root, normalize(path));
+  if (!full.startsWith(root + "/") && full !== root) {
+    return { ok: false, error: "Error: path escapes the notes folder." };
+  }
+  return { ok: true, full };
+}
+
+/**
  * Read a note from the user's notes directory.
- *
- * Path safety: rejects parent traversal (`..`), absolute paths, and any
- * resolved path that escapes the notes root. The model can only read
- * files inside the configured notes directory.
  */
 export function makeReadNoteTool(notesRoot: string): Tool {
   const root = resolve(notesRoot);
@@ -131,23 +148,114 @@ export function makeReadNoteTool(notesRoot: string): Tool {
       },
     },
     execute: async (args) => {
-      const path = args.path;
-      if (typeof path !== "string" || path.length === 0) {
-        return "Error: 'path' argument is required and must be a non-empty string.";
+      const r = resolveNotePath(root, args.path);
+      if (!r.ok) return r.error;
+      try {
+        return await Bun.file(r.full).text();
+      } catch (e: any) {
+        return `Error: could not read '${args.path}': ${e?.message ?? e}`;
       }
-      if (path.includes("..") || path.startsWith("/")) {
-        return "Error: path must be a filename within the notes folder, not a parent or absolute path.";
+    },
+  };
+}
+
+/**
+ * List markdown notes in the notes directory. Returns a newline-delimited
+ * list of filenames. No arguments — broad-stroke "what's there?" lookup.
+ */
+export function makeListNotesTool(notesRoot: string): Tool {
+  const root = resolve(notesRoot);
+  return {
+    definition: {
+      name: "list_notes",
+      description: "List the filenames of all notes in the user's notes folder.",
+      parameters: { type: "object", properties: {} },
+    },
+    execute: async () => {
+      try {
+        const entries = await readdir(root);
+        const notes = entries.filter((e) => e.endsWith(".md")).sort();
+        if (notes.length === 0) return "(no notes)";
+        return notes.join("\n");
+      } catch (e: any) {
+        return `Error: could not list notes: ${e?.message ?? e}`;
       }
-      const full = resolve(root, normalize(path));
-      // Belt-and-braces: confirm the resolved path is still inside the root.
-      if (!full.startsWith(root + "/") && full !== root) {
-        return "Error: path escapes the notes folder.";
+    },
+  };
+}
+
+/**
+ * Write (or overwrite) a markdown note. Restricted to `.md` files inside
+ * the notes root. Same path-safety guarantees as read_note.
+ */
+export function makeWriteNoteTool(notesRoot: string): Tool {
+  const root = resolve(notesRoot);
+  return {
+    definition: {
+      name: "write_note",
+      description: "Write a new note or overwrite an existing one. Filename must end in '.md'.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Filename, e.g., 'shopping.md'." },
+          content: { type: "string", description: "Markdown body to save." },
+        },
+        required: ["path", "content"],
+      },
+    },
+    execute: async (args) => {
+      const r = resolveNotePath(root, args.path);
+      if (!r.ok) return r.error;
+      if (!r.full.endsWith(".md")) {
+        return "Error: filename must end in '.md'.";
+      }
+      const content = args.content;
+      if (typeof content !== "string") {
+        return "Error: 'content' argument is required and must be a string.";
       }
       try {
-        const content = await Bun.file(full).text();
-        return content;
+        await Bun.write(r.full, content);
+        return `Wrote ${args.path} (${content.length} chars).`;
       } catch (e: any) {
-        return `Error: could not read '${path}': ${e?.message ?? e}`;
+        return `Error: could not write '${args.path}': ${e?.message ?? e}`;
+      }
+    },
+  };
+}
+
+/**
+ * Search notes by filename substring (case-insensitive). Returns matching
+ * filenames newline-delimited. Doesn't search content — that's RAG (v5).
+ */
+export function makeSearchNotesByFilenameTool(notesRoot: string): Tool {
+  const root = resolve(notesRoot);
+  return {
+    definition: {
+      name: "search_notes_by_filename",
+      description: "Find notes whose filename contains the given substring (case-insensitive).",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Substring to match against filenames." },
+        },
+        required: ["query"],
+      },
+    },
+    execute: async (args) => {
+      const query = args.query;
+      if (typeof query !== "string" || query.length === 0) {
+        return "Error: 'query' argument is required and must be a non-empty string.";
+      }
+      try {
+        const entries = await readdir(root);
+        const q = query.toLowerCase();
+        const matches = entries
+          .filter((e) => e.endsWith(".md") && e.toLowerCase().includes(q))
+          .sort();
+        if (matches.length === 0) return `(no notes match '${query}')`;
+        return matches.join("\n");
+      } catch (e: any) {
+        return `Error: could not search notes: ${e?.message ?? e}`;
       }
     },
   };

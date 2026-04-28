@@ -105,8 +105,8 @@ Each version introduces exactly one new mental model. We do not advance until th
 | **v1** | ✅ shipped | Context management | Token budget, sliding window, summarization | Context is a resource, not a free buffet |
 | **v2** | ✅ shipped | Persistence | Save/load conversations to disk | Session memory vs long-term memory; restart safety |
 | **v3** | ✅ shipped | One tool (two, actually) | Tool schema, model decision, execution, result injection, validate-and-retry | The mechanics of an agent loop; the cost of dated models |
-| **v4** | next | Multi-tool routing | 3–5 tools, tool selection, error handling | The capacity ceiling — how many tools before quality collapses |
-| **v5** | future | Local RAG | Embeddings, vector store, retrieval before generation | Retrieval-augmented generation; "knowing about X" vs "remembering X" |
+| **v4** | ✅ shipped | Multi-tool routing | 3–5 tools, tool selection, error handling | The capacity ceiling — how many tools before quality collapses |
+| **v5** | next | Local RAG | Embeddings, vector store, retrieval before generation | Retrieval-augmented generation; "knowing about X" vs "remembering X" |
 | **v6** | future | Web search | External tool, fetch + parse + summarize | Live data, source citation, latency |
 | **v7** | future | Model routing | Add a second tier (mid or frontier), `ModelClient` abstraction, routing policy, cost/latency logs | When to escalate, what the privacy boundary buys, the cost/quality/latency triangle |
 | **v8** | future | Scheduling / background | Cron-style triggers, notifications, persistent agent loop | The assistant runs even when I'm not looking |
@@ -128,6 +128,7 @@ bun run eval/v0.ts   # substrate (latency, statelessness, token growth)
 bun run eval/v1.ts   # context management
 bun run eval/v2.ts   # persistence (kill → reload → recall)
 bun run eval/v3.ts   # tool calling (registry, dispatch, agent loop)
+bun run eval/v4.ts   # multi-tool routing (5 tools, selection + arg validity)
 ```
 
 Notes folder: `~/.assistant/notes/*.md` — drop markdown files there and the assistant can `read_note` them. Sessions live at `~/.assistant/sessions/`.
@@ -151,7 +152,7 @@ What a 3B-class instruct model genuinely struggles with — to be confirmed empi
 | **Refusal vs. attempt** | Tries to answer when it should say "I don't know" | Add explicit "if unsure, say so" to system prompt |
 | **Confabulation under context loss** | When a fact has been evicted from the sliding window, model invents a plausible-sounding wrong answer rather than admitting it doesn't know (observed v1 eval, Qwen 2.5-3B: invented "Omniscientophilia" when "petrichor" had aged out) | **Mitigation verified at 3B scale (v1 post-fix):** explicit "if you don't know, say so plainly" in system prompt flipped reply to a graceful "I don't know what your favorite obscure word is because I wasn't previously told." Pin salient facts and summarize-on-eviction are still on the roadmap. |
 | ~~**System-prompt sensitivity** (Qwen 2.5)~~ | Qwen 2.5-3B's tool calling collapsed when *any* additional system-prompt clause was added (even "Say if unsure"). Verbose anti-confab prompt + tools were mutually exclusive. | **Resolved at v3 by upgrading to Qwen 3-4B-Instruct-2507.** Newer model handles verbose system prompt + tools cleanly. The "tradeoff" was a model staleness artifact, not a fundamental SLM property. |
-| ~~**Discrimination (over-calling)**~~ | Qwen 2.5-3B reflexively called `get_current_time` for unrelated prompts ("What's 2+2?", "Make up a haiku") — 1/5 correct skip rate. | **Resolved at v3 by Qwen 3-4B.** Discrimination went 1/5 → 5/5. Same eval, newer model, no architectural change. |
+| ~~**Discrimination (over-calling)**~~ | Qwen 2.5-3B reflexively called `get_current_time` for unrelated prompts ("What's 2+2?", "Make up a haiku") — 1/5 correct skip rate. | **Resolved at v3 by Qwen 3-4B.** Discrimination went 1/5 → 5/5. Confirmed at v4 with 5 tools active: still 5/5 — over-call bias did not return when the toolset grew. |
 | **Hallucinated tool names** | Qwen 2.5 occasionally emitted tool calls with names that don't exist (e.g., `function`, `suggest_farmers_market_activity`). Hermes-3-3B leaked its native tool format (`[TOOL_RESULT...`) into user-visible text. | **Mitigated by validate-and-retry** (v3.5): unknown tool names produce a tool-result error that lists actual available tools, giving the model a chance to retry on the next loop iteration. Largely a non-issue on Qwen 3-4B regardless. |
 | **Code generation > 30 lines** | Drift, syntax errors, broken imports | Don't use it for this. Tool-call to a coder model if needed. |
 
@@ -257,7 +258,7 @@ Living document. Drives architectural decisions like "should this task tier go t
 Things we don't know yet, and intend to learn:
 
 1. What's the practical context limit for Qwen-3B before quality drops? (KV cache says ~8K is feasible RAM-wise, but does the model coherently use 8K?)
-2. How many tools can Qwen-3B handle before tool selection collapses? (Hypothesis: 4–5)
+2. ~~How many tools can Qwen-3B handle before tool selection collapses?~~ **Partially answered (v4 eval, Qwen 3-4B):** at 5 tools the model is *not* near the cliff — 30/30 on a curated test set spanning all five, plus a clean 2-step composition (`list_notes` → `read_note`). Hypothesis "4–5" was too pessimistic for this generation of model. Open question becomes: where *is* the cliff? 8 tools? 12? Worth probing at v5+ as the toolset grows.
 3. Does CoT prompting ("think step by step") help or hurt at this scale?
 4. Is `Phi-3.5-mini` better than Qwen for reasoning-heavy tasks at the same RAM cost?
 5. Is `DeepSeek-R1-Distill-Qwen-1.5B` worth a slot for explicit reasoning tasks even though it's not generalist?
@@ -294,6 +295,8 @@ Architectural choices, with reasons. So future-William remembers why.
 | 2026-04-28 | Promoted primary local model from Qwen 2.5-3B to Qwen 3-4B-Instruct-2507 | v3 work surfaced that Qwen 2.5-3B couldn't tolerate verbose system prompt + tools. Investigation across Hermes-3-Llama-3.2-3B-4bit (worse: format leakage, high variance) and a separate Claude's recommendation pointed to model staleness. Qwen 3-4B closes all observed gaps: 14/14 on v3 eval *with* the v1 anti-confab prompt active. |
 | 2026-04-28 | `executeToolCall` validates parsed args against the tool's JSON schema before dispatching | Robust against the model emitting malformed args (missing required fields, wrong types, unknown tool names). Failed validation returns a structured error message; the next agent-loop iteration gives the model a chance to self-correct. Cheaper than constrained decoding and a useful primitive regardless of which model we route to. |
 | 2026-04-28 | Constrained decoding deferred (not adopted at v3) | Identified by an external consultation as the production-grade primitive for guaranteed schema adherence (GBNF in llama.cpp, Outlines, XGrammar). For our MLX-based stack, support is patchy. With Qwen 3-4B's empirical reliability, the immediate need disappeared. Reconsider when v7 routing introduces a llama.cpp-served tier where GBNF is native. |
+| 2026-04-28 | v4 ships with 5 tools, not 4, despite the pass condition naming "4 tools" | The pass condition (≥22/30) was a hedge; the underlying goal is "stress tool selection past the v3 comfort zone." Five tools (`get_current_time`, `read_note`, `list_notes`, `write_note`, `search_notes_by_filename`) give a stronger signal — and three of them (`read_note`, `list_notes`, `search_notes_by_filename`) deliberately overlap semantically, which is the routing failure mode the eval is meant to surface. Result: 30/30 + clean control + clean 2-step composition. |
+| 2026-04-28 | Path-safety helper factored out of `read_note` once 3 callers needed it | Three is the threshold for DRY; below that, duplication is cheaper than a helper. With `read_note`, `write_note`, and (implicitly via filesystem ops) the others all needing the same parent-traversal / absolute-path / escape checks, the helper finally pays for itself. |
 
 ## 9. Out of scope (for now)
 
