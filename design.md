@@ -129,6 +129,7 @@ What a 3B-class instruct model genuinely struggles with — to be confirmed empi
 | **Negation & quantifiers** | "All X except Y" → handles X, ignores Y | Phrase prompts in positive form |
 | **Following a tool result** | Ignores tool output, repeats the original answer | Explicit "based on the tool result above…" framing |
 | **Refusal vs. attempt** | Tries to answer when it should say "I don't know" | Add explicit "if unsure, say so" to system prompt |
+| **Confabulation under context loss** | When a fact has been evicted from the sliding window, model invents a plausible-sounding wrong answer rather than admitting it doesn't know (observed v1 eval, Qwen-3B: invented "Omniscientophilia" when the original fact "petrichor" had aged out of context) | Pin salient facts; system prompt must instruct refusal on uncertainty; consider summarizing dropped turns rather than discarding |
 | **Code generation > 30 lines** | Drift, syntax errors, broken imports | Don't use it for this. Tool-call to a coder model if needed. |
 
 We will keep this section updated as we hit specific cliffs.
@@ -244,6 +245,8 @@ Things we don't know yet, and intend to learn:
 10. **Routing:** does the local model's own self-assessment ("I'm not sure about this") correlate with actual answer quality, or is it noise? If correlation is real, we can use it to drive escalation cheaply.
 11. **Routing:** when a request escalates from local to frontier, does the frontier need the original conversation history, or is the latest message + a summary enough? (Cost vs quality tradeoff.)
 12. **Privacy:** what's the right user-facing affordance for "this stays local"? A `:private` tag in notes? A folder? A regex? All three?
+13. **Confabulation:** does adding "if you're not certain, say 'I don't remember'" to the system prompt actually reduce hallucinated recall, or does the 3B model confidently override it? (Empirical question, run the v1 confabulation test with and without the instruction.)
+14. **Eval design:** v1 surfaced that subtle eval choices (distractor content, question phrasing) materially change conclusions about model capability. We need a discipline around eval prompts: neutral distractors, no answer-shaped escape hatches, control runs on a frontier model to confirm the test is actually solvable.
 
 ## 8. Decision log
 
