@@ -14,7 +14,7 @@
  * (v2-ish), pinned facts, durable memory promotion.
  */
 
-import type { Msg } from "./client";
+import type { Msg, ToolCallReq } from "./client";
 import type { TurnRecord } from "./sessions";
 
 /**
@@ -88,6 +88,16 @@ export class Context {
     this.messages.push({ role: "assistant", content: text });
   }
 
+  /** Append an assistant turn that's requesting one or more tool calls. */
+  addAssistantToolCalls(text: string, toolCalls: ToolCallReq[]) {
+    this.messages.push({ role: "assistant", content: text, toolCalls });
+  }
+
+  /** Append the result of a previously-requested tool call. */
+  addToolResult(toolCallId: string, result: string) {
+    this.messages.push({ role: "tool", content: result, toolCallId });
+  }
+
   /** Reset history; preserve system prompt and reset cumulative counters. */
   clear() {
     this.messages = [];
@@ -107,12 +117,22 @@ export class Context {
     for (const r of records) {
       if (r.role === "system") {
         this.system = { role: "system", content: r.content };
-      } else if (r.role === "user" || r.role === "assistant") {
-        this.messages.push({ role: r.role, content: r.content });
-        if (r.role === "assistant") {
-          this.cumulativeIn += r.promptTokens ?? 0;
-          this.cumulativeOut += r.completionTokens ?? 0;
-        }
+      } else if (r.role === "user") {
+        this.messages.push({ role: "user", content: r.content });
+      } else if (r.role === "assistant") {
+        this.messages.push({
+          role: "assistant",
+          content: r.content,
+          toolCalls: r.toolCalls,
+        });
+        this.cumulativeIn += r.promptTokens ?? 0;
+        this.cumulativeOut += r.completionTokens ?? 0;
+      } else if (r.role === "tool") {
+        this.messages.push({
+          role: "tool",
+          content: r.content,
+          toolCallId: r.toolCallId,
+        });
       }
     }
   }
@@ -129,18 +149,38 @@ export class Context {
 
   /**
    * Messages to send for the next request. Applies sliding window:
-   * drop oldest user/assistant pair (2 messages) until estimate fits.
-   * System is never dropped. Latest user message is never dropped.
+   * drops the oldest "logical turn" until the estimate fits the budget.
+   *
+   * A logical turn = a user message and everything that follows it up to
+   * (but not including) the next user message. This means tool calls and
+   * tool results stay grouped with their originating user request and
+   * never orphan-leak into the request as a tool message without its
+   * tool_call ancestor (which the API would reject).
+   *
+   * System message is never dropped. Latest user message is never dropped.
    */
   messagesForRequest(): Msg[] {
     const allowedHistory = this._budget - this.reservedForResponse - this.tokensFor([this.system]);
     let history = [...this.messages];
 
     while (this.tokensFor(history) > allowedHistory && history.length > 1) {
-      // Drop oldest pair (assumed user/assistant alternation).
-      // If only one stale message remains alongside the latest, drop it.
-      const dropCount = history.length >= 3 ? 2 : 1;
-      history = history.slice(dropCount);
+      // Find the start of the second logical turn — the next user message
+      // after index 0. Slicing from there drops the entire first turn.
+      let nextUserIdx = -1;
+      for (let i = 1; i < history.length; i++) {
+        if (history[i]?.role === "user") {
+          nextUserIdx = i;
+          break;
+        }
+      }
+      if (nextUserIdx < 0) {
+        // Only one user message in history (the current one). Can't drop
+        // a turn while preserving the latest. Stop trimming here; if it
+        // still doesn't fit, the model server will be the next line of
+        // defense (and probeServerCapabilities warned us at startup).
+        break;
+      }
+      history = history.slice(nextUserIdx);
     }
 
     return [this.system, ...history];

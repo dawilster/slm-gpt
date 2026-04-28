@@ -20,7 +20,7 @@ These are the cards we're playing.
 |---|---|
 | Hardware | M1 MacBook Air, 8GB unified memory |
 | Available headroom | ~3.5–4 GB for a model after OS + apps |
-| Primary local model | Qwen2.5-3B-Instruct (4-bit MLX), ~1.8GB |
+| Primary local model | Qwen3-4B-Instruct-2507 (4-bit MLX), ~2.4GB |
 | Steady-state inference | ~20 tok/s via LM Studio (~25 tok/s direct mlx-lm) |
 | Context window | Practical ceiling ~4K–8K tokens (KV cache eats RAM at long context) |
 | Tool calling | Adequate at this size with Qwen; weak with Llama 3.2 |
@@ -129,7 +129,10 @@ What a 3B-class instruct model genuinely struggles with — to be confirmed empi
 | **Negation & quantifiers** | "All X except Y" → handles X, ignores Y | Phrase prompts in positive form |
 | **Following a tool result** | Ignores tool output, repeats the original answer | Explicit "based on the tool result above…" framing |
 | **Refusal vs. attempt** | Tries to answer when it should say "I don't know" | Add explicit "if unsure, say so" to system prompt |
-| **Confabulation under context loss** | When a fact has been evicted from the sliding window, model invents a plausible-sounding wrong answer rather than admitting it doesn't know (observed v1 eval, Qwen-3B: invented "Omniscientophilia" when "petrichor" had aged out) | **Mitigation verified at 3B scale (v1 post-fix):** explicit "if you don't know, say so plainly" in system prompt flipped reply to a graceful "I don't know what your favorite obscure word is because I wasn't previously told." Pin salient facts and summarize-on-eviction are still on the roadmap. |
+| **Confabulation under context loss** | When a fact has been evicted from the sliding window, model invents a plausible-sounding wrong answer rather than admitting it doesn't know (observed v1 eval, Qwen 2.5-3B: invented "Omniscientophilia" when "petrichor" had aged out) | **Mitigation verified at 3B scale (v1 post-fix):** explicit "if you don't know, say so plainly" in system prompt flipped reply to a graceful "I don't know what your favorite obscure word is because I wasn't previously told." Pin salient facts and summarize-on-eviction are still on the roadmap. |
+| ~~**System-prompt sensitivity** (Qwen 2.5)~~ | Qwen 2.5-3B's tool calling collapsed when *any* additional system-prompt clause was added (even "Say if unsure"). Verbose anti-confab prompt + tools were mutually exclusive. | **Resolved at v3 by upgrading to Qwen 3-4B-Instruct-2507.** Newer model handles verbose system prompt + tools cleanly. The "tradeoff" was a model staleness artifact, not a fundamental SLM property. |
+| ~~**Discrimination (over-calling)**~~ | Qwen 2.5-3B reflexively called `get_current_time` for unrelated prompts ("What's 2+2?", "Make up a haiku") — 1/5 correct skip rate. | **Resolved at v3 by Qwen 3-4B.** Discrimination went 1/5 → 5/5. Same eval, newer model, no architectural change. |
+| **Hallucinated tool names** | Qwen 2.5 occasionally emitted tool calls with names that don't exist (e.g., `function`, `suggest_farmers_market_activity`). Hermes-3-3B leaked its native tool format (`[TOOL_RESULT...`) into user-visible text. | **Mitigated by validate-and-retry** (v3.5): unknown tool names produce a tool-result error that lists actual available tools, giving the model a chance to retry on the next loop iteration. Largely a non-issue on Qwen 3-4B regardless. |
 | **Code generation > 30 lines** | Drift, syntax errors, broken imports | Don't use it for this. Tool-call to a coder model if needed. |
 
 We will keep this section updated as we hit specific cliffs.
@@ -268,6 +271,9 @@ Architectural choices, with reasons. So future-William remembers why.
 | 2026-04-28 | Sessions stored in `~/.assistant/sessions/` as append-only JSONL, one file per session | XDG-ish hidden home dir is conventional for personal assistants and survives project moves. JSONL is greppable, streamable, append-friendly, and lossless. One-file-per-session matches "session" semantics and makes `/load` meaningful. |
 | 2026-04-28 | Always start a new session by default; `/load` and `/resume` are explicit | Auto-resume surprises users (where did this assistant get my context from?). Explicit is safer; sessions are cheap to create. |
 | 2026-04-28 | Restoring a session uses its *stored* system prompt, not the current default | Continuity. If the default prompt changes between sessions, an old conversation should still behave as it originally did. |
+| 2026-04-28 | Promoted primary local model from Qwen 2.5-3B to Qwen 3-4B-Instruct-2507 | v3 work surfaced that Qwen 2.5-3B couldn't tolerate verbose system prompt + tools. Investigation across Hermes-3-Llama-3.2-3B-4bit (worse: format leakage, high variance) and a separate Claude's recommendation pointed to model staleness. Qwen 3-4B closes all observed gaps: 14/14 on v3 eval *with* the v1 anti-confab prompt active. |
+| 2026-04-28 | `executeToolCall` validates parsed args against the tool's JSON schema before dispatching | Robust against the model emitting malformed args (missing required fields, wrong types, unknown tool names). Failed validation returns a structured error message; the next agent-loop iteration gives the model a chance to self-correct. Cheaper than constrained decoding and a useful primitive regardless of which model we route to. |
+| 2026-04-28 | Constrained decoding deferred (not adopted at v3) | Identified by an external consultation as the production-grade primitive for guaranteed schema adherence (GBNF in llama.cpp, Outlines, XGrammar). For our MLX-based stack, support is patchy. With Qwen 3-4B's empirical reliability, the immediate need disappeared. Reconsider when v7 routing introduces a llama.cpp-served tier where GBNF is native. |
 
 ## 9. Out of scope (for now)
 

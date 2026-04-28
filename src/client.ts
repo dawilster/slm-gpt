@@ -12,9 +12,34 @@
 
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
+import type { ToolDefinition } from "./tools";
 
-export type Role = "system" | "user" | "assistant";
-export type Msg = { role: Role; content: string };
+export type Role = "system" | "user" | "assistant" | "tool";
+
+/** A request to call a tool, as emitted by the model. */
+export type ToolCallReq = {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    /** JSON-encoded arguments. */
+    arguments: string;
+  };
+};
+
+/**
+ * Internal message shape. Covers regular text turns, assistant turns
+ * that carry tool_calls (model wants to invoke a tool), and tool turns
+ * (the result of one of those calls being fed back to the model).
+ */
+export type Msg = {
+  role: Role;
+  content: string;
+  /** Assistant turns only — present when the assistant requested tool calls. */
+  toolCalls?: ToolCallReq[];
+  /** Tool turns only — the id of the tool_call this message answers. */
+  toolCallId?: string;
+};
 
 export type Usage = {
   promptTokens: number;
@@ -22,7 +47,10 @@ export type Usage = {
 };
 
 export type CompletionResult = {
+  /** The assistant's text reply. May be empty when only tool calls are emitted. */
   reply: string;
+  /** Tool calls the model emitted, if any. */
+  toolCalls?: ToolCallReq[];
   usage: Usage;
   latencyMs: number;
 };
@@ -30,12 +58,37 @@ export type CompletionResult = {
 export type CompletionOptions = {
   temperature?: number;
   maxTokens?: number;
+  /** Tools available to the model for this request. */
+  tools?: ToolDefinition[];
 };
 
 export interface ModelClient {
   /** stable identifier for telemetry/routing logs */
   readonly id: string;
   complete(messages: Msg[], options?: CompletionOptions): Promise<CompletionResult>;
+}
+
+/** Convert an internal Msg to the OpenAI API's expected message shape. */
+function toApiMessage(m: Msg): ChatCompletionMessageParam {
+  if (m.role === "tool") {
+    return {
+      role: "tool",
+      tool_call_id: m.toolCallId ?? "",
+      content: m.content,
+    };
+  }
+  if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
+    return {
+      role: "assistant",
+      content: m.content || null,
+      tool_calls: m.toolCalls.map((tc) => ({
+        id: tc.id,
+        type: "function",
+        function: { name: tc.function.name, arguments: tc.function.arguments },
+      })),
+    };
+  }
+  return { role: m.role as "system" | "user" | "assistant", content: m.content };
 }
 
 export class OpenAICompatClient implements ModelClient {
@@ -53,15 +106,29 @@ export class OpenAICompatClient implements ModelClient {
     const t0 = Date.now();
     const resp = await this.client.chat.completions.create({
       model: this.model,
-      messages: messages as ChatCompletionMessageParam[],
+      messages: messages.map(toApiMessage),
       temperature: options.temperature ?? 0.7,
       max_tokens: options.maxTokens,
+      tools: options.tools?.map((t) => ({ type: "function" as const, function: t })),
     });
     const latencyMs = Date.now() - t0;
-    const reply = resp.choices[0]?.message.content ?? "";
+    const choice = resp.choices[0];
+    const message = choice?.message;
+    const reply = message?.content ?? "";
+    const rawToolCalls = message?.tool_calls;
+    const toolCalls: ToolCallReq[] | undefined = rawToolCalls
+      ?.filter((tc): tc is typeof tc & { function: { name: string; arguments: string } } =>
+        tc.type === "function" && tc.function?.name != null,
+      )
+      .map((tc) => ({
+        id: tc.id,
+        type: "function" as const,
+        function: { name: tc.function.name, arguments: tc.function.arguments ?? "{}" },
+      }));
     const usage = resp.usage;
     return {
       reply,
+      toolCalls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined,
       latencyMs,
       usage: {
         promptTokens: usage?.prompt_tokens ?? 0,

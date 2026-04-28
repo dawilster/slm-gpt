@@ -15,7 +15,13 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export type TurnRole = "system" | "user" | "assistant";
+export type TurnRole = "system" | "user" | "assistant" | "tool";
+
+export type SavedToolCall = {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+};
 
 export type TurnRecord = {
   role: TurnRole;
@@ -26,6 +32,9 @@ export type TurnRecord = {
   promptTokens?: number;
   completionTokens?: number;
   latencyMs?: number;
+  toolCalls?: SavedToolCall[];
+  // tool-only:
+  toolCallId?: string;
 };
 
 export type SessionMeta = {

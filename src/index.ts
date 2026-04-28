@@ -24,16 +24,19 @@
  */
 
 import * as readline from "node:readline/promises";
+import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { OpenAICompatClient, discoverModel, probeServerCapabilities } from "./client";
 import { Context } from "./context";
 import { Assistant } from "./assistant";
 import { SessionStore, type Session } from "./sessions";
+import { ToolRegistry, getCurrentTimeTool, makeReadNoteTool } from "./tools";
 
 const BASE_URL = process.env.MODEL_BASE_URL ?? "http://localhost:1234/v1";
 const API_KEY = process.env.MODEL_API_KEY ?? "lm-studio";
 const ASSISTANT_HOME = process.env.ASSISTANT_HOME ?? join(process.env.HOME ?? "", ".assistant");
 
+// Strengthened to discourage confabulation under context loss (v1 finding).
 const SYSTEM = [
   "You are a helpful personal assistant. Be concise and direct.",
   "If you don't know or don't remember something, say so plainly.",
@@ -78,6 +81,14 @@ async function main() {
   const store = new SessionStore(join(ASSISTANT_HOME, "sessions"));
   await store.ensure();
 
+  // Notes folder + tool registry. Both tools are always available — v3
+  // is "the agent loop works", v4 is where multi-tool routing gets stressed.
+  const notesRoot = join(ASSISTANT_HOME, "notes");
+  await mkdir(notesRoot, { recursive: true });
+  const registry = new ToolRegistry();
+  registry.register(getCurrentTimeTool);
+  registry.register(makeReadNoteTool(notesRoot));
+
   // Decide initial session based on CLI args.
   let session: Session;
   const mode = parseArgs(process.argv);
@@ -106,12 +117,12 @@ async function main() {
     session = await freshSession(store);
   }
 
-  const assistant = new Assistant(context, client, session);
+  const assistant = new Assistant(context, client, session, registry);
 
   const ctxNote = caps ? `  ·  server ctx: ${caps.contextLimit}` : "";
-  console.log(`assistant v2  ·  model: ${modelId}  ·  budget: ${DEFAULT_BUDGET}${ctxNote}`);
-  console.log(`session: ${session.id}`);
-  console.log("commands: /quit  /clear  /new  /history  /tokens  /context  /budget [n]  /sessions  /load <id>  /resume\n");
+  console.log(`assistant v3  ·  model: ${modelId}  ·  budget: ${DEFAULT_BUDGET}${ctxNote}`);
+  console.log(`session: ${session.id}  ·  tools: ${registry.size()}  ·  notes: ${notesRoot}`);
+  console.log("commands: /quit  /clear  /new  /history  /tokens  /context  /budget [n]  /sessions  /load <id>  /resume  /tools\n");
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
@@ -205,6 +216,22 @@ async function main() {
       continue;
     }
 
+    if (input === "/tools") {
+      const tools = registry.list();
+      if (tools.length === 0) {
+        console.log("  (no tools registered)\n");
+      } else {
+        for (const t of tools) {
+          const params = Object.keys(t.definition.parameters.properties);
+          const sig = params.length === 0 ? "()" : `(${params.join(", ")})`;
+          console.log(`  ${t.definition.name}${sig}`);
+          console.log(`     ${t.definition.description.slice(0, 100)}${t.definition.description.length > 100 ? "…" : ""}`);
+        }
+        console.log();
+      }
+      continue;
+    }
+
     if (input === "/resume") {
       const list = await store.list(10);
       const candidate = list.find((s) => s.id !== assistant.sessionId);
@@ -223,9 +250,10 @@ async function main() {
       const r = await assistant.chat(input);
       console.log(`\nassistant: ${r.reply}`);
       const trimNote = r.trimmed ? `  ⚠ trimmed: sent ${r.sentMessages} of ${r.totalMessages}` : "";
+      const toolNote = r.toolCallsExecuted > 0 ? `  tools=${r.toolCallsExecuted}  steps=${r.steps}` : "";
       console.log(
         `  └─ prompt_tokens=${r.promptTokens}  completion_tokens=${r.completionTokens}  ` +
-          `latency=${r.latencyMs}ms${trimNote}\n`,
+          `latency=${r.latencyMs}ms${toolNote}${trimNote}\n`,
       );
     } catch (e: any) {
       console.log(`[error] ${e?.message ?? e}\n`);
