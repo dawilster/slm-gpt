@@ -15,6 +15,7 @@
  */
 
 import type { Msg } from "./client";
+import type { TurnRecord } from "./sessions";
 
 /**
  * Estimate token count from char count. Cheap approximation,
@@ -92,6 +93,28 @@ export class Context {
     this.messages = [];
     this.cumulativeIn = 0;
     this.cumulativeOut = 0;
+  }
+
+  /**
+   * Replace in-memory state with a saved sequence of turn records.
+   * The session's stored system prompt overrides the constructor's
+   * default — restoring is meant to recreate the original conversation.
+   */
+  restore(records: TurnRecord[]) {
+    this.messages = [];
+    this.cumulativeIn = 0;
+    this.cumulativeOut = 0;
+    for (const r of records) {
+      if (r.role === "system") {
+        this.system = { role: "system", content: r.content };
+      } else if (r.role === "user" || r.role === "assistant") {
+        this.messages.push({ role: r.role, content: r.content });
+        if (r.role === "assistant") {
+          this.cumulativeIn += r.promptTokens ?? 0;
+          this.cumulativeOut += r.completionTokens ?? 0;
+        }
+      }
+    }
   }
 
   recordUsage(promptTokens: number, completionTokens: number) {

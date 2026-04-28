@@ -265,6 +265,9 @@ Architectural choices, with reasons. So future-William remembers why.
 | 2026-04-28 | Privacy boundary enforced *before* routing | Sensitive content can never reach a hosted tier, regardless of routing pressure. The router asks "is this allowed to leave?" before "where should it go?" |
 | 2026-04-28 | Default system prompt includes anti-confabulation instruction | v1 eval showed Qwen-3B confabulates by default but admits uncertainty when explicitly told to. Cheap mitigation, large behavioral effect. |
 | 2026-04-28 | Probe server's loaded context length at startup; warn if budget exceeds it | v1 surfaced silent prompt truncation (LM Studio at 4096 + budget at 8192 → server chops oldest turns, indistinguishable from a model recall failure). Now we warn at startup and the eval refuses to run if the server can't host the test. |
+| 2026-04-28 | Sessions stored in `~/.assistant/sessions/` as append-only JSONL, one file per session | XDG-ish hidden home dir is conventional for personal assistants and survives project moves. JSONL is greppable, streamable, append-friendly, and lossless. One-file-per-session matches "session" semantics and makes `/load` meaningful. |
+| 2026-04-28 | Always start a new session by default; `/load` and `/resume` are explicit | Auto-resume surprises users (where did this assistant get my context from?). Explicit is safer; sessions are cheap to create. |
+| 2026-04-28 | Restoring a session uses its *stored* system prompt, not the current default | Continuity. If the default prompt changes between sessions, an old conversation should still behave as it originally did. |
 
 ## 9. Out of scope (for now)
 

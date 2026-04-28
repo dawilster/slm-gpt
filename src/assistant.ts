@@ -9,6 +9,7 @@
 
 import type { CompletionOptions, ModelClient } from "./client";
 import type { Context } from "./context";
+import type { Session } from "./sessions";
 
 export type TurnResult = {
   reply: string;
@@ -27,7 +28,17 @@ export class Assistant {
   constructor(
     private context: Context,
     private client: ModelClient,
+    private session: Session | null = null,
   ) {}
+
+  /** Swap the active session (e.g., after /load or /new). */
+  setSession(s: Session | null) {
+    this.session = s;
+  }
+
+  get sessionId(): string | null {
+    return this.session?.id ?? null;
+  }
 
   async chat(userText: string, options: CompletionOptions = {}): Promise<TurnResult> {
     this.context.addUser(userText);
@@ -39,6 +50,25 @@ export class Assistant {
     const result = await this.client.complete(messagesToSend, options);
     this.context.addAssistant(result.reply);
     this.context.recordUsage(result.usage.promptTokens, result.usage.completionTokens);
+
+    // Persist both turns to the active session, best-effort.
+    // We surface failures as warnings rather than crashing the chat loop —
+    // the in-memory conversation is the authoritative state mid-session.
+    if (this.session) {
+      try {
+        await this.session.append({ role: "user", content: userText });
+        await this.session.append({
+          role: "assistant",
+          content: result.reply,
+          model: this.client.id,
+          promptTokens: result.usage.promptTokens,
+          completionTokens: result.usage.completionTokens,
+          latencyMs: result.latencyMs,
+        });
+      } catch (e: any) {
+        console.warn(`[persist warning] could not append to session ${this.session.id}: ${e?.message ?? e}`);
+      }
+    }
 
     return {
       reply: result.reply,
