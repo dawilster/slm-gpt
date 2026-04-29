@@ -13,6 +13,8 @@
  *   /resume              load the most recent session that isn't the current one
  *   /profile             show stored facts about the user
  *   /forget <key>        remove a fact from the profile
+ *   /reindex             rebuild the corpus index over notes + sessions
+ *   /corpus              list the indexed sources
  *
  * CLI flags:
  *   --resume             start by loading the most recent saved session
@@ -39,10 +41,14 @@ import {
   makeListNotesTool,
   makeReadNoteTool,
   makeRememberTool,
+  makeSearchCorpusTool,
   makeSearchNotesByFilenameTool,
   makeWriteNoteTool,
 } from "./tools";
 import { Profile } from "./profile";
+import { EmbeddingClient, discoverEmbeddingModel } from "./embeddings";
+import { IndexStore } from "./index_store";
+import { indexAll } from "./indexer";
 
 const BASE_URL = process.env.MODEL_BASE_URL ?? "http://localhost:1234/v1";
 const API_KEY = process.env.MODEL_API_KEY ?? "lm-studio";
@@ -63,6 +69,10 @@ const BASE_SYSTEM = [
   "- When the user states a stable fact about themselves (preference, name, location, relationship), call remember(key, value).",
   "- When the user signals a change to a known fact — including phrasings like 'I don't like X anymore', 'I now prefer Y', 'I take it Z now', 'actually, I W' — call remember(key, value) with the NEW value to overwrite the old one. Don't just acknowledge verbally; call the tool.",
   "- Only call forget(key) if the fact no longer applies AND has no replacement.",
+  "Retrieval rules:",
+  "- DEFAULT TO RETRIEVAL. Before answering ANY question that could even tangentially involve the user's content, call search_corpus first. The only exceptions: pure meta-questions ('what tools do you have'), simple time queries, or instructions to perform an action you can do directly.",
+  "- This applies even to questions that *look* like general knowledge: 'what is X', 'how does Y work', 'tell me about Z' — the user may have notes on X/Y/Z. Search first, then synthesize. If nothing relevant comes back, then answer from general knowledge AND say so.",
+  "- For questions about places, preferences, names, experiences, recipes, or anything personal: always retrieve. The user is asking *you* (their personal assistant), not a general chatbot — they expect grounding in their own content.",
 ].join("\n");
 
 function buildSystemPrompt(profile: Profile): string {
@@ -110,11 +120,25 @@ async function main() {
   const store = new SessionStore(join(ASSISTANT_HOME, "sessions"));
   await store.ensure();
 
-  // Notes folder + tool registry. v5 adds remember/forget for profile facts
-  // (current truth about the user, always loaded into the system prompt) on
-  // top of the v4 note-tools. 7 tools total.
+  // Notes folder + tool registry. v6 adds the search_corpus tool for
+  // semantic retrieval over notes + past sessions (8 tools total). The
+  // embedding client targets the same LM Studio endpoint as the chat model.
   const notesRoot = join(ASSISTANT_HOME, "notes");
+  const sessionsRoot = join(ASSISTANT_HOME, "sessions");
   await mkdir(notesRoot, { recursive: true });
+  await mkdir(sessionsRoot, { recursive: true });
+
+  const embeddingModel = await discoverEmbeddingModel(BASE_URL, API_KEY);
+  let indexStore: IndexStore | null = null;
+  let embedder: EmbeddingClient | null = null;
+  if (embeddingModel) {
+    embedder = new EmbeddingClient({ baseURL: BASE_URL, apiKey: API_KEY, model: embeddingModel });
+    indexStore = new IndexStore(join(ASSISTANT_HOME, "index.sqlite"));
+  } else {
+    console.warn("⚠ no embedding model loaded at " + BASE_URL + " — search_corpus disabled.");
+    console.warn("  Load text-embedding-nomic-embed-text-v1.5 in LM Studio to enable RAG.\n");
+  }
+
   const registry = new ToolRegistry();
   registry.register(getCurrentTimeTool);
   registry.register(makeReadNoteTool(notesRoot));
@@ -123,6 +147,9 @@ async function main() {
   registry.register(makeSearchNotesByFilenameTool(notesRoot));
   registry.register(makeRememberTool(profile));
   registry.register(makeForgetTool(profile));
+  if (indexStore && embedder) {
+    registry.register(makeSearchCorpusTool({ store: indexStore, embedder }));
+  }
 
   // Decide initial session based on CLI args.
   let session: Session;
@@ -158,10 +185,34 @@ async function main() {
 
   const assistant = new Assistant(context, client, session, registry);
 
+  // Lazy on-launch indexing. Skip the currently-open session — it's mid-write
+  // and already in chat context, so indexing it now would be redundant. It
+  // gets picked up on the next launch.
+  if (indexStore && embedder) {
+    try {
+      const r = await indexAll({
+        store: indexStore,
+        embedder,
+        notesRoot,
+        sessionsRoot,
+        excludeSessionId: session.id,
+      });
+      const indexedSomething = r.notesIndexed + r.sessionsIndexed > 0;
+      if (indexedSomething) {
+        console.log(
+          `[index] +${r.chunksAdded} chunks  (${r.notesIndexed} notes, ${r.sessionsIndexed} sessions, ${r.skipped} unchanged)`,
+        );
+      }
+    } catch (e: any) {
+      console.warn(`[index] failed: ${e?.message ?? e} — search_corpus may return stale or empty results`);
+    }
+  }
+
   const ctxNote = caps ? `  ·  server ctx: ${caps.contextLimit}` : "";
-  console.log(`assistant v5  ·  model: ${modelId}  ·  budget: ${DEFAULT_BUDGET}${ctxNote}`);
-  console.log(`session: ${session.id}  ·  tools: ${registry.size()}  ·  notes: ${notesRoot}  ·  profile: ${profile.size()} facts`);
-  console.log("commands: /quit  /clear  /new  /history  /tokens  /context  /budget [n]  /sessions  /load <id>  /resume  /tools  /profile  /forget <key>\n");
+  const indexNote = indexStore ? `  ·  corpus: ${indexStore.chunkCount()} chunks` : "  ·  corpus: off";
+  console.log(`assistant v6  ·  model: ${modelId}  ·  budget: ${DEFAULT_BUDGET}${ctxNote}`);
+  console.log(`session: ${session.id}  ·  tools: ${registry.size()}  ·  profile: ${profile.size()} facts${indexNote}`);
+  console.log("commands: /quit  /clear  /new  /history  /tokens  /context  /budget [n]  /sessions  /load <id>  /resume  /tools  /profile  /forget <key>  /reindex  /corpus\n");
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
@@ -256,6 +307,42 @@ async function main() {
       context.setSystemPrompt(buildSystemPrompt(profile));
       assistant.setSession(store.open(id));
       console.log(`  loaded ${id} (${turns.length} turns)\n`);
+      continue;
+    }
+
+    if (input === "/reindex") {
+      if (!indexStore || !embedder) {
+        console.log("  (corpus indexing is off — no embedding model loaded)\n");
+        continue;
+      }
+      try {
+        const r = await indexAll({
+          store: indexStore,
+          embedder,
+          notesRoot,
+          sessionsRoot,
+          excludeSessionId: assistant.sessionId ?? undefined,
+        });
+        console.log(
+          `  reindexed: +${r.chunksAdded} chunks  (${r.notesIndexed} notes, ${r.sessionsIndexed} sessions, ${r.skipped} unchanged)\n`,
+        );
+      } catch (e: any) {
+        console.log(`  [error] ${e?.message ?? e}\n`);
+      }
+      continue;
+    }
+
+    if (input === "/corpus") {
+      if (!indexStore) {
+        console.log("  (corpus indexing is off)\n");
+        continue;
+      }
+      const sources = indexStore.listSources();
+      console.log(`  ${indexStore.chunkCount()} chunks across ${sources.length} sources:`);
+      for (const s of sources) {
+        console.log(`    [${s.source_type}] ${s.source_path}`);
+      }
+      console.log();
       continue;
     }
 

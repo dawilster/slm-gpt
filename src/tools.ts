@@ -11,6 +11,8 @@
 import { readdir } from "node:fs/promises";
 import { normalize, resolve } from "node:path";
 import { Profile } from "./profile";
+import type { EmbeddingClient } from "./embeddings";
+import type { IndexStore, ScoredChunk } from "./index_store";
 
 export type ToolDefinition = {
   name: string;
@@ -233,7 +235,8 @@ export function makeSearchNotesByFilenameTool(notesRoot: string): Tool {
   return {
     definition: {
       name: "search_notes_by_filename",
-      description: "Find notes whose filename contains the given substring (case-insensitive).",
+      description:
+        "Look up notes by filename substring (case-insensitive). Only useful when you already know part of a filename. For content-based questions ('what did I write about X', 'tell me about Y') use search_corpus instead — this tool only matches filenames, not content.",
       parameters: {
         type: "object",
         properties: {
@@ -331,4 +334,62 @@ export function makeForgetTool(profile: Profile): Tool {
       return `Forgot '${normalized}'.`;
     },
   };
+}
+
+/**
+ * search_corpus(query) — semantic search over indexed notes + past sessions.
+ *
+ * The model calls this when the user asks about content not currently in
+ * chat context — "what did I write about X", "have we discussed Y before",
+ * "summarize the brisbane note". Returns the top-K chunks above a similarity
+ * threshold, formatted with their source attribution so the model can cite back.
+ *
+ * The retrieval cap is deliberately small (k=3) and the threshold conservative
+ * (sim >= 0.3): at a 4K budget, dropping 10 mediocre chunks into context costs
+ * more than it surfaces. Better to retrieve nothing than retrieve noise.
+ */
+export function makeSearchCorpusTool(opts: {
+  store: IndexStore;
+  embedder: EmbeddingClient;
+}): Tool {
+  return {
+    definition: {
+      name: "search_corpus",
+      description:
+        "Search the user's personal notes and past chat sessions for relevant passages. Call this whenever the user asks about something they have written, recorded, said, or discussed before — including general questions about topics they have notes on (e.g. 'what is petrichor' if they have a petrichor note, 'what coffee am I drinking', 'tell me about my dive in Cairns'). Prefer this over read_note when you don't already know the exact filename. Returns up to 3 passages ranked by semantic similarity, each tagged with its source.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Natural-language description of what to find (a question, topic, or phrase).",
+          },
+        },
+        required: ["query"],
+      },
+    },
+    execute: async (args) => {
+      const query = args.query;
+      if (typeof query !== "string" || query.trim().length === 0) {
+        return "Error: 'query' must be a non-empty string.";
+      }
+      let queryEmbedding: Float32Array;
+      try {
+        queryEmbedding = await opts.embedder.embed(query);
+      } catch (e: any) {
+        return `Error: embedding failed: ${e?.message ?? e}`;
+      }
+      const results = opts.store.search(queryEmbedding, { k: 3, minSimilarity: 0.3 });
+      if (results.length === 0) return `(no relevant content found for '${query}')`;
+      return formatResults(results);
+    },
+  };
+}
+
+function formatResults(results: ScoredChunk[]): string {
+  const blocks = results.map((r, i) => {
+    const sim = r.similarity.toFixed(2);
+    return `[${i + 1}] sim=${sim}\n${r.displayText}`;
+  });
+  return blocks.join("\n\n---\n\n");
 }
