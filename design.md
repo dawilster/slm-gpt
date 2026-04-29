@@ -95,6 +95,62 @@ We'll start with explicit override + static rules (v7), and add confidence-based
 
 **Observability:** every routed request logs `{tier, latency_ms, cost_usd, fallback_chain}` to a local file. Without this, you can't tell whether the router is making good decisions; with it, you can answer "what fraction of my requests went to frontier last month, and was the answer worth the price?"
 
+### 3.5 Local resource awareness
+
+A cloud LLM owns its slice of GPU and RAM. A local SLM on an 8GB M1 Air shares everything with the rest of the user's machine — browser, IDE, video calls, builds, language servers. The available resource envelope at any moment is *sporadic*, not stable. The brain has to plan for that.
+
+**Failure modes measured (perf_kv + perf_gen evals, 2026-04-29):**
+
+- The MLX inference worker crashes mid-stream under memory pressure (exit code null, no graceful error). After the crash, the model auto-reloads at a smaller context, and downstream requests fail with "input greater than context length" — a single OOM event cascades into a degraded-state bug.
+- Generation throughput decays as the KV cache fills: ~21 → ~16 tok/s across one 3.8K-token completion at 4K context. Long replies cost more user time per token than short ones.
+- Inference contends with the user's interactive work. A 30s prompt-eval pegs the CPU and the user's IDE feels it.
+
+**Strategies (layer in as we hit pain):**
+
+1. **Pre-flight resource check.** Sample free RAM / CPU before each request. Below threshold: refuse with a clear message, defer, or trim context preemptively. Cheap safety rail; addresses the OOM crash directly.
+2. **Adaptive context budget.** `budget = f(free memory, conversation length, user signal)`, not a static knob. Cap dynamically; let the high watermark stay generous.
+3. **Single-track queueing.** Local inference is effectively single-threaded. Never two outstanding local requests at once. Background jobs (indexing, grooming) explicitly wait behind foreground work.
+4. **Backoff + re-route on crash.** Detect worker crashes, wait for reload, retry once. If it crashes again on the same prompt, escalate to mid/frontier — the local system literally cannot host it right now.
+5. **Pressure-driven routing.** Today's routing asks "is this hard enough to escalate?" Pressure-driven routing asks "even if local *could* answer, is now the right time?" Memory pressure becomes a routing input alongside difficulty.
+6. **Background tasks yield.** v9's scheduled / cron / proactive work MUST yield to foreground use — run at idle, throttle on user activity, pause during memory pressure. The line between "the assistant runs in the background" and "the assistant makes my laptop unusable" is exactly this discipline.
+7. **Model lifecycle.** After N minutes idle, unload the model to free ~2.4GB for the user's other work. Reload on next request (cost: ~3s once). The brain owns this decision.
+8. **User-signaled priority.** "Urgent" vs "whenever" is an explicit override that lets pressure-driven scheduling do the right thing without the user having to decode indicator lights.
+
+**Observability:** every request logs resource state at issue time — free memory, CPU%, queue depth, currently-loaded model. Without this we can't tell whether the brain made good calls under load; with it we can ask "what fraction of crashes correlated with high pressure?" and "did pressure-routing escalate work it didn't need to?"
+
+The mental shift: cloud routing asks "where should this run?" once. Local routing asks "where should this run *and is now the right time?*" — every request.
+
+### 3.6 Background runtime
+
+Today the brain is a foreground REPL — start it, talk to it, quit. Tomorrow it has to run as a long-lived daemon that wakes periodically, checks for work, and reaches out to the user when something deserves their attention.
+
+Two pieces, architecturally linked.
+
+**The daemon loop.** A long-running process that:
+
+- wakes on a schedule (cron-style time-of-day, or fixed interval) to evaluate pending work
+- pulls from a task queue: scheduled reminders, deferred questions, retries from prior failures, proactive grooming passes (see §7 #15)
+- yields aggressively to foreground use — see §3.5 strategy #6
+- survives system sleep / wake; restarts cleanly on boot; never silently loses queued work
+
+The cadence isn't single-mode. Some tasks fire on cron (daily summary at 8am); others poll (calendar event in 10 min, file appeared in `~/inbox/`); others react (notification dispatched, user replied). The daemon orchestrates; the model only runs when there's actually something to do.
+
+**System notifications.** A daemon that can't surface anything runs in a forest with no one to hear it. The brain needs at least one *outbound* channel that doesn't require the user to be staring at a terminal:
+
+- **Baseline:** macOS native notifications (osascript or equivalent) — low-friction "I noticed X."
+- **Escalation:** a higher-priority tier (sound + persistent banner) for items the user explicitly flagged important.
+- **Cross-channel** (v10+): iMessage, Slack, etc. Same primitive, different transport. The notification helper is the substrate; channel adapters layer on top.
+
+Notifications respect system focus state — macOS Do Not Disturb / Focus modes are a hard signal. Non-urgent items defer until the user is reachable.
+
+**Coordination boundaries:**
+
+- **Daemon vs REPL.** If the user is actively in a foreground REPL session, the daemon must NOT run inference simultaneously (single-track queue, see §3.5 #3). Coordination via a shared lock file or simple IPC.
+- **Restart safety.** If the daemon dies mid-task, the next wake detects and resumes / retries — work is persisted before execution, not after.
+- **Dry runs.** A "show me what you'd do" mode for new scheduled tasks before they fire for real. Background work the user can't audit is background work the user won't trust.
+
+What lands first (when v9 ships): a notification helper + a daemon mode that wakes every N minutes to check a markdown task list. The task list itself is `~/.assistant/tasks/*.md` — same principle as memory in §3 (greppable, version-controllable, AI-readable).
+
 ## 4. The Trajectory
 
 Each version introduces exactly one new mental model. We do not advance until the previous one is felt.
@@ -287,6 +343,10 @@ Things we don't know yet, and intend to learn:
     - **C. Use it as the local mid-tier in v8 routing.** A thinking model that never leaves the laptop is actually the most interesting "mid tier" the routing design could hit — keeps the privacy boundary intact while still escalating beyond Instruct on hard prompts. Falls cleanly out of the trajectory.
     - **D. Reserve it for offline grooming.** Background passes over sessions/notes (proactive profile saves, summary generation, fact extraction) are exactly the workload reasoning models earn their keep on. Avoids the per-turn latency tax entirely. Pairs naturally with question #15.
     Working hypothesis: **C + D** is the right shape — Thinking is the on-architecture answer to "how do we escalate beyond Instruct without leaving the laptop?", and grooming is the workload where reasoning pays off without the latency tax. B is the cheap probe that would harden this hypothesis. Revisit when v6 RAG lands and v8 routing becomes the next architectural concern.
+17. **Resource thresholds (§3.5):** what free-RAM threshold should trigger refuse / defer / route-away on an 8GB system? Hypothesis: <1GB free is dangerous given Qwen 4B's ~2.4GB footprint and the KV cache spikes we observed, but this needs measurement against actual crash rates.
+18. **Pressure-signal accuracy (§3.5):** does macOS `memory_pressure` (or `vm_stat` derivations) correlate with actual inference-worker crash risk, or is the only honest signal "we tried to inference and it crashed, retroactively"? The latter forces strategy #4 (backoff + reroute) to do real work; the former enables proactive prevention.
+19. **Daemon-vs-REPL coordination primitive (§3.6):** file lock? Unix socket? A row in a shared SQLite? The simplest thing that survives crashes and doesn't require the user to manually clear stale state wins.
+20. **Notification taxonomy (§3.6):** is two tiers enough (informational vs urgent), or do we need finer grain — and how does the user define which is which without becoming an admin? Inversion candidate: classify-on-emit ("this is the first thing that matched the rule, so it's urgent; the next twenty are noise"), not classify-on-rule.
 
 ## 8. Decision log
 
@@ -317,6 +377,8 @@ Architectural choices, with reasons. So future-William remembers why.
 | 2026-04-28 | Profile is a flat key→value JSON file, rendered into the system prompt at the start of each user turn | Three alternatives considered: (a) sectioned markdown — nice for hand-editing, but tools doing markdown surgery is gnarly. (b) free-form text appended to system prompt by the model itself — model is unreliable at maintaining structure. (c) flat KV with normalize-on-write — wins on simplicity. Keys are lowercased + whitespace-collapsed so "Dog Name" and "dog  name" don't double-enter. The system prompt is rebuilt before every chat turn so newly-saved facts surface immediately. |
 | 2026-04-28 | v5 system prompt is verbose (memory rules + examples) where v0–v4 prompts were terse | Tested empirically: the terse one-liner ("update facts when they change") missed implicit changes like "I don't like eggs anymore" — supersession was 1/3. Adding example phrases ("'I don't like X anymore', 'I now prefer Y', 'actually, I W'") brought it to 2/3. The general rule "small models cope better with terse prompts" still holds, but instruction-shaped text *with examples* is an exception worth paying for when the failure mode is discrimination, not generation. |
 | 2026-04-28 | v5 override category (profile beats recent-chat contradiction) is tracked but ungated | The test setup ("user said in chat history they love eggs, but profile says dislike — what does the model say?") is *inherently* ambiguous: in real use, the right answer is "ask which is current". A 4B model won't do that, and forcing a binary right-or-wrong on an ambiguous case would teach the eval to lie. We log the result for visibility and don't fail the build on it. The honest correctness bar is "model handles the *current-turn* supersession case" (the gated supersession category), not "model resolves history-vs-profile contradictions". |
+| 2026-04-29 | Local resource awareness (§3.5) and background runtime (§3.6) elevated to first-class architectural concerns | Empirical: KV-quant test runs (`eval/perf_kv.ts`) crashed the inference worker mid-stream at 6K-token prompts on 8GB M1; throughput decay measured at ~25% across a 3.8K-token completion (`eval/perf_gen.ts`). The brain on local hardware lives inside a sporadic resource envelope — that constraint shapes routing, queueing, scheduling, and lifecycle decisions. Elevating it to its own architectural section now means v8 routing inherits "pressure as a routing input" and v9 daemon work inherits "yield aggressively" rather than bolting both on later. |
+| 2026-04-29 | LM Studio KV cache quantization marked unusable on the current build (v0.4.12) | Empirically broken at both 8-bit and 4-bit: `NameError: name 'tree_reduce' is not defined` in the MLX runtime's quant path the moment a prompt crosses the activation threshold; subsequent worker crash. Single working data point (1K prompt) was below the quant threshold and therefore proves nothing. Disable until LM Studio updates; revisit then. Captured here so future-William doesn't repeat the experiment without checking the version. |
 
 ## 9. Out of scope (for now)
 
@@ -334,4 +396,4 @@ These are deferred, not rejected. They land when their prerequisite work is in p
 
 ---
 
-*Last updated: 2026-04-28. Update at every architectural decision, every learned constraint, every shipped version.*
+*Last updated: 2026-04-29. Update at every architectural decision, every learned constraint, every shipped version.*
