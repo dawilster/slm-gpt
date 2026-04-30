@@ -143,20 +143,28 @@ final class DockWindowController: NSObject, NSWindowDelegate {
     }
 }
 
-/// Hosted SwiftUI root that observes AppState and switches between dock
-/// screens. Handles Escape-to-dismiss and Enter-to-send transitions.
+/// Hosted SwiftUI root that observes AppState and renders the dock chat.
+/// `.shortcut` is kept as a static demo until the runtime exposes
+/// shortcut/multi-step traces in the chat itself.
 private struct DockHost: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
         Group {
             switch state.dockScreen {
-            case .idle:     DockIdleView()
-            case .thinking: DockThinkingView()
-            case .shortcut: DockShortcutView()
+            case .idle, .thinking:
+                DockChatView()
+                    .environment(\.runtimeStatus, state.runtimeStatus)
+            case .shortcut:
+                DockShortcutView()
             }
         }
         .onKeyPress(.escape) {
+            // If a turn is mid-flight, abort it and stay on the dock.
+            if state.chat.status == .thinking {
+                state.chat.cancel()
+                return .handled
+            }
             state.dockScreen = .idle
             state.menubarState = .idle
             NSApp.keyWindow?.orderOut(nil)

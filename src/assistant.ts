@@ -53,6 +53,13 @@ export type ToolCallObserver = (info: {
 export type ChatOptions = CompletionOptions & {
   maxSteps?: number;
   onToolCall?: ToolCallObserver;
+  /**
+   * Token observer. When set, the assistant uses the model client's
+   * streaming variant and forwards each text delta. Tool-call rounds still
+   * complete atomically before being executed, so observers see only text
+   * tokens — never partial tool invocations.
+   */
+  onToken?: (text: string) => void;
 };
 
 const DEFAULT_MAX_STEPS = 5;
@@ -99,7 +106,9 @@ export class Assistant {
       lastSent = messagesToSend.length;
       lastTrimmed = lastSent < this.context.all().length;
 
-      const result = await this.client.complete(messagesToSend, { ...options, tools });
+      const result = options.onToken
+        ? await this.client.completeStreaming(messagesToSend, { ...options, tools, onToken: options.onToken })
+        : await this.client.complete(messagesToSend, { ...options, tools });
       totalIn += result.usage.promptTokens;
       totalOut += result.usage.completionTokens;
       totalLatency += result.latencyMs;

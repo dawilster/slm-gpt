@@ -47,12 +47,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.onHotkeyChange = { [weak self] new in self?.registerHotkey(new) }
         registerHotkey(state.hotkey)
 
+        // Periodic runtime health probe — drives the "Ready / Offline" status
+        // in the dock and the menubar dropdown.
+        startHealthProbe()
+
         // First-launch flow.
         if !state.hasCompletedOnboarding {
             showOnboarding()
         } else if !state.hasCompletedFirstRun {
             showFirstRun()
         }
+    }
+
+    private var healthTimer: Timer?
+
+    private func startHealthProbe() {
+        Task { await self.probeOnce() }
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { _ in
+            Task { @MainActor in await AppDelegate.shared?.probeOnce() }
+        }
+    }
+
+    @MainActor
+    private func probeOnce() async {
+        do {
+            let h = try await RuntimeClient.shared.health()
+            AppState.shared.runtimeStatus = RuntimeStatus(
+                connected:   true,
+                modelLabel:  h.model,
+                contextHint: h.contextLimit.map { "\($0/1024)K ctx" }
+            )
+        } catch {
+            if AppState.shared.runtimeStatus.connected {
+                AppState.shared.runtimeStatus = .offline
+            }
+        }
+    }
+
+    static var shared: AppDelegate? {
+        NSApp.delegate as? AppDelegate
     }
 
     // MARK: Hotkey

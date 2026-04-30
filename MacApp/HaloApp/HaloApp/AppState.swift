@@ -26,6 +26,12 @@ final class AppState {
     var menubarState: HaloMenubarState = .idle
     var dockScreen: DockScreen = .idle
 
+    /// Live conversation surfaced in the dock.
+    let chat = ChatSession()
+
+    /// Health probe of the local runtime daemon (model, context, online flag).
+    var runtimeStatus: RuntimeStatus = .offline
+
     /// User-bindable hotkey, persisted to UserDefaults. Mutating it
     /// triggers re-registration via `onHotkeyChange`.
     var hotkey: Hotkey {

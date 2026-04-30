@@ -60,6 +60,7 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 0) {
             switch selected {
             case .model:  modelPane
+            case .memory: MemoryPane()
             case .hotkey: hotkeyPane
             default:
                 Text(selected.label)
@@ -261,12 +262,13 @@ private struct ModelListRow: View {
 // MARK: - Section identifiers
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case general, model, hotkey, voice, shortcuts, privacy, appearance, about
+    case general, model, memory, hotkey, voice, shortcuts, privacy, appearance, about
     var id: String { rawValue }
     var label: String {
         switch self {
         case .general:    return "General"
         case .model:      return "Model"
+        case .memory:     return "Memory"
         case .hotkey:     return "Hotkey"
         case .voice:      return "Voice"
         case .shortcuts:  return "Shortcuts"

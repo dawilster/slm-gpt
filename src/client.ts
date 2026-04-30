@@ -62,10 +62,27 @@ export type CompletionOptions = {
   tools?: ToolDefinition[];
 };
 
+/**
+ * Token-streaming variant. The client yields incremental text chunks via
+ * `onToken` (each is a piece of the assistant's reply, in arrival order)
+ * and resolves with the same final shape as `complete()`. Tool calls are
+ * accumulated across deltas and surfaced atomically in the resolved
+ * `CompletionResult` — they never partially reach the caller.
+ */
+export type StreamingOptions = CompletionOptions & {
+  onToken?: (text: string) => void;
+};
+
 export interface ModelClient {
   /** stable identifier for telemetry/routing logs */
   readonly id: string;
   complete(messages: Msg[], options?: CompletionOptions): Promise<CompletionResult>;
+  /**
+   * Streaming variant. Implementations may delegate to `complete()` if the
+   * underlying transport doesn't support streaming — callers should treat
+   * the absence of token deltas as "model returned in one go".
+   */
+  completeStreaming(messages: Msg[], options?: StreamingOptions): Promise<CompletionResult>;
 }
 
 /** Convert an internal Msg to the OpenAI API's expected message shape. */
@@ -134,6 +151,77 @@ export class OpenAICompatClient implements ModelClient {
         promptTokens: usage?.prompt_tokens ?? 0,
         completionTokens: usage?.completion_tokens ?? 0,
       },
+    };
+  }
+
+  /**
+   * Streaming completion. Yields text deltas via `onToken` as the model
+   * generates them; accumulates tool-call deltas (which arrive fragmented:
+   * the function name lands first, then arguments arrive a few chars at a
+   * time across chunks) and surfaces them only in the final resolved value.
+   */
+  async completeStreaming(messages: Msg[], options: StreamingOptions = {}): Promise<CompletionResult> {
+    const t0 = Date.now();
+    const stream = await this.client.chat.completions.create({
+      model: this.model,
+      messages: messages.map(toApiMessage),
+      temperature: options.temperature ?? 0.7,
+      max_tokens: options.maxTokens,
+      tools: options.tools?.map((t) => ({ type: "function" as const, function: t })),
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+
+    let reply = "";
+    // Tool calls stream as deltas indexed by `index`; we collate them as we go.
+    const toolBuf = new Map<number, { id?: string; name?: string; args: string }>();
+    let promptTokens = 0;
+    let completionTokens = 0;
+
+    for await (const chunk of stream) {
+      const choice = chunk.choices?.[0];
+      const delta = choice?.delta;
+
+      if (delta?.content) {
+        reply += delta.content;
+        options.onToken?.(delta.content);
+      }
+      if (delta?.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          if (typeof tc.index !== "number") continue;
+          const slot = toolBuf.get(tc.index) ?? { args: "" };
+          if (tc.id)              slot.id   = tc.id;
+          if (tc.function?.name)  slot.name = tc.function.name;
+          if (tc.function?.arguments) slot.args += tc.function.arguments;
+          toolBuf.set(tc.index, slot);
+        }
+      }
+      // Final chunk on streaming includes usage when stream_options requested it.
+      if (chunk.usage) {
+        promptTokens     = chunk.usage.prompt_tokens     ?? promptTokens;
+        completionTokens = chunk.usage.completion_tokens ?? completionTokens;
+      }
+    }
+
+    const latencyMs = Date.now() - t0;
+    const toolCalls: ToolCallReq[] = [];
+    // Stable order — keys are the model-assigned indices.
+    const indices = [...toolBuf.keys()].sort((a, b) => a - b);
+    for (const i of indices) {
+      const slot = toolBuf.get(i)!;
+      if (!slot.id || !slot.name) continue;          // skip incomplete entries
+      toolCalls.push({
+        id: slot.id,
+        type: "function",
+        function: { name: slot.name, arguments: slot.args || "{}" },
+      });
+    }
+
+    return {
+      reply,
+      toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+      latencyMs,
+      usage: { promptTokens, completionTokens },
     };
   }
 }
