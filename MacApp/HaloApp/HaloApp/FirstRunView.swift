@@ -19,7 +19,7 @@ struct FirstRunView: View {
                         Text("Downloading your model")
                             .font(.haloUI(15, weight: .semibold))
                             .tracking(-0.15)
-                        Text("This happens once. Halo runs entirely on your Mac after this.")
+                        Text("This happens once. Milo runs entirely on your Mac after this.")
                             .font(.haloUI(12))
                             .foregroundStyle(Color.haloFgDim)
                     }

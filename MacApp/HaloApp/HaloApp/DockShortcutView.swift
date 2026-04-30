@@ -16,7 +16,7 @@ struct DockShortcutView: View {
     private let steps: [Step] = [
         .init(app: "Notes",
               title: "Create note",
-              detail: "“Halo could route shortcuts through a planner step before execution.”",
+              detail: "“Milo could route shortcuts through a planner step before execution.”",
               state: .done, time: "0.4s"),
         .init(app: "Reminders",
               title: "Set timer · 20 min",

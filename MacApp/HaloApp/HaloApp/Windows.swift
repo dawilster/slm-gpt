@@ -29,15 +29,35 @@ final class DockWindowController: NSObject, NSWindowDelegate {
     /// UserDefaults key for the dragged position.
     private static let originKey = "halo.dock.origin"
 
+    /// True once the user manually drags an edge to resize. Their height
+    /// is preserved across summons until the next fresh conversation,
+    /// where `summon()` resets it.
+    private var userResized = false
+    /// Set while we mutate the panel's frame programmatically, so
+    /// windowDidResize doesn't misclassify our own changes as user drags.
+    private var settingFrameInternally = false
+
+    /// Default panel height when no user-chosen size is in effect.
+    /// Wide enough to show ~5 messages without scrolling; chat scrolls
+    /// inside for anything larger.
+    private static let defaultHeight: CGFloat = 480
+
     init(state: AppState) {
         self.state = state
 
         let panel = HaloDockPanel(
             contentRect: NSRect(x: 0, y: 0, width: HaloMetrics.dockWidth, height: 200),
-            styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
+            // .resizable lets the user grab any edge to resize. Borderless
+            // hides the title bar; the resize cursor still appears at edges.
+            styleMask: [.borderless, .resizable, .nonactivatingPanel, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
+        // Lock width — only height is user-resizable. Anything outside
+        // 60pt..95% of the screen is rejected.
+        let screen = NSScreen.main?.visibleFrame.height ?? 1200
+        panel.minSize = NSSize(width: HaloMetrics.dockWidth, height: 60)
+        panel.maxSize = NSSize(width: HaloMetrics.dockWidth, height: screen * 0.95)
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.level = .floating
@@ -89,9 +109,17 @@ final class DockWindowController: NSObject, NSWindowDelegate {
     /// Show — at the saved origin if present, otherwise centered above the dock.
     func summon() {
         refreshContent()
-        let fittingSize = host.fittingSize
-        let w = max(HaloMetrics.dockWidth, fittingSize.width)
-        let h = max(60, fittingSize.height)
+
+        // Brand-new chat → forget any user-chosen size so we open compact.
+        if state.chat.messages.isEmpty {
+            userResized = false
+        }
+
+        // Fixed sizing: default height for fresh chats, last user-chosen
+        // height otherwise. No automatic content-driven resize — the chat
+        // scrolls inside the panel.
+        let w = HaloMetrics.dockWidth
+        let h: CGFloat = userResized ? panel.frame.height : Self.defaultHeight
 
         let origin: NSPoint = {
             if let saved = DockWindowController.loadOrigin(),
@@ -103,8 +131,10 @@ final class DockWindowController: NSObject, NSWindowDelegate {
             return NSPoint(x: frame.midX - w / 2, y: frame.minY + 28)
         }()
 
+        settingFrameInternally = true
         panel.setFrame(NSRect(origin: origin, size: CGSize(width: w, height: h)),
                        display: true, animate: false)
+        settingFrameInternally = false
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
     }
@@ -121,38 +151,41 @@ final class DockWindowController: NSObject, NSWindowDelegate {
         host.rootView = AnyView(view)
     }
 
-    /// Called by the SwiftUI host whenever its intrinsic height changes.
-    /// Resizes the panel so the dock grows with the conversation, anchored
-    /// to the bottom edge so the input row stays put as messages pile up.
-    private func contentHeightChanged(_ height: CGFloat) {
-        guard panel.isVisible, height > 0 else { return }
-        let screenCap = (NSScreen.main?.visibleFrame.height ?? 800) * 0.75
-        let target = min(max(60, height), screenCap)
-
-        let oldFrame = panel.frame
-        if abs(target - oldFrame.height) < 1 { return }
-
-        // Keep bottom edge fixed (grow upward).
-        let newFrame = NSRect(
-            x: oldFrame.minX,
-            y: oldFrame.minY,
-            width: oldFrame.width,
-            height: target
-        )
-        panel.setFrame(newFrame, display: true, animate: false)
-    }
+    /// Intentionally a no-op. The panel uses a fixed default height (or
+    /// the user's last manual size) — content scrolls inside instead of
+    /// pushing the window taller. Auto-expansion bumped messages off-screen
+    /// when the model produced very long replies; manual control wins.
+    private func contentHeightChanged(_ height: CGFloat) {}
 
     // MARK: NSWindowDelegate
 
-    /// Click outside dismisses.
+    /// Click outside dismisses — but only when focus actually leaves the
+    /// app. If another Halo window (menubar dropdown, Settings, …) takes
+    /// key, the dock stays open in the background so the user doesn't lose
+    /// their conversation while glancing at status or settings.
     func windowDidResignKey(_ notification: Notification) {
-        DispatchQueue.main.async { [weak self] in self?.dismiss() }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            // Defer one runloop so NSApp.keyWindow reflects the post-resign state.
+            if NSApp.keyWindow == nil {
+                self.dismiss()
+            }
+        }
     }
 
     /// User dragged the dock — remember the new origin so the next summon
     /// reuses it.
     func windowDidMove(_ notification: Notification) {
         DockWindowController.saveOrigin(panel.frame.origin)
+    }
+
+    /// Called for both programmatic and user-driven resizes — distinguish
+    /// via the `settingFrameInternally` flag so we only flip `userResized`
+    /// when the user actually grabbed an edge.
+    func windowDidResize(_ notification: Notification) {
+        if !settingFrameInternally {
+            userResized = true
+        }
     }
 
     // MARK: - Position persistence

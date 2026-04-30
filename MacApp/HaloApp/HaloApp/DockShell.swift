@@ -79,7 +79,7 @@ struct DockStatusStrip: View {
 // MARK: - Input row — small orb + text field (or placeholder) + ⌘K hint + ↵
 
 struct DockInputRow: View {
-    var placeholder: String = "Ask Halo…"
+    var placeholder: String = "Ask Milo…"
     var showHints: Bool = false
     var disabled: Bool = false
     var onSubmit: (String) -> Void = { _ in }

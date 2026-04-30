@@ -66,7 +66,7 @@ struct MenubarPanelView: View {
                 onRunSetup()
             }
             Divider()
-            Button("Quit Halo") { NSApp.terminate(nil) }
+            Button("Quit Milo") { NSApp.terminate(nil) }
         }
     }
 
@@ -77,7 +77,7 @@ struct MenubarPanelView: View {
             HStack(spacing: 10) {
                 HaloOrb(size: 26, state: state.menubarState)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("Halo")
+                    Text("Milo")
                         .font(.haloUI(13, weight: .semibold))
                         .tracking(-0.13)
                     Text("Ready · Local")
@@ -175,7 +175,7 @@ struct MenubarPanelView: View {
 
     private func loadRecents() async {
         do {
-            recents = try await RuntimeClient.shared.sessions(limit: 8)
+            recents = try await RuntimeClient.shared.sessions(limit: 5)
         } catch {
             recents = []
         }

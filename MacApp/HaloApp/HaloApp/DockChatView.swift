@@ -25,9 +25,10 @@ struct DockChatView: View {
                     .padding(.top, 18).padding(.bottom, 14)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                // No fixed maxHeight — the SwiftUI content sizes itself
-                // naturally, the surrounding NSPanel grows to match
-                // (capped at 75% of the screen by DockWindowController).
+                // Pin content to the bottom — when the user manually drags
+                // the panel taller, the empty space appears at the top and
+                // the latest message stays right above the input row.
+                .defaultScrollAnchor(.bottom)
                 .onChange(of: state.chat.messages.count) { _, _ in
                     if let last = state.chat.messages.last {
                         withAnimation(.easeOut(duration: 0.2)) {
@@ -38,7 +39,7 @@ struct DockChatView: View {
             }
 
             DockInputRow(
-                placeholder: state.chat.messages.isEmpty ? "Ask Halo…" : "Reply or follow up…",
+                placeholder: state.chat.messages.isEmpty ? "Ask Milo…" : "Reply or follow up…",
                 showHints: state.chat.messages.isEmpty,
                 disabled: state.chat.status == .thinking,
                 onSubmit: { text in state.chat.send(text) }
@@ -163,6 +164,7 @@ private struct MessageRow: View {
 
                 if !message.text.isEmpty {
                     replyText
+                    MessageMetaStrip(message: message)
                 } else if message.isStreaming && message.toolCalls.isEmpty {
                     ThinkingIndicator()
                 }
@@ -175,6 +177,84 @@ private struct MessageRow: View {
     private var replyText: some View {
         MarkdownText(text: message.text, isStreaming: message.isStreaming)
             .textSelection(.enabled)
+    }
+}
+
+// MARK: - Per-message metadata strip (TTFT, total tokens, copy)
+
+/// Quiet footer beneath an assistant reply. Surfaces:
+///   – time-to-first-token (live, set on the first SSE token event)
+///   – completion-token count + total latency once the turn lands
+///   – copy-to-pasteboard button
+private struct MessageMetaStrip: View {
+    @Bindable var message: ChatMessage
+
+    var body: some View {
+        HStack(spacing: 12) {
+            if let ttft = message.timeToFirstTokenMs {
+                Label {
+                    Text("\(ttft)ms")
+                        .font(.haloMono(10.5))
+                        .monospacedDigit()
+                } icon: {
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: 9))
+                }
+                .foregroundStyle(Color.haloFgFaint)
+                .help("Time to first token")
+            }
+            if let meta = message.meta {
+                Label {
+                    Text("\(meta.completionTokens) tok · \(meta.latencyMs)ms")
+                        .font(.haloMono(10.5))
+                        .monospacedDigit()
+                } icon: {
+                    Image(systemName: "tag")
+                        .font(.system(size: 9))
+                }
+                .foregroundStyle(Color.haloFgFaint)
+                .help("Completion tokens · total turn latency")
+            }
+            Spacer(minLength: 0)
+            CopyButton(text: message.text)
+        }
+        .padding(.top, 2)
+    }
+}
+
+private struct CopyButton: View {
+    let text: String
+
+    @State private var copied = false
+    @State private var hovered = false
+
+    var body: some View {
+        Button(action: copy) {
+            HStack(spacing: 4) {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 10, weight: .medium))
+                Text(copied ? "Copied" : "Copy")
+                    .font(.haloUI(10.5))
+            }
+            .foregroundStyle(copied ? Color.haloGreen
+                             : (hovered ? Color.haloFg : Color.haloFgFaint))
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(Color.white.opacity(hovered ? 0.06 : 0))
+                    .animation(.easeOut(duration: 0.10), value: hovered)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
+    }
+
+    private func copy() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        copied = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
     }
 }
 

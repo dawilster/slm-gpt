@@ -21,6 +21,10 @@ final class ChatMessage: Identifiable {
     var isStreaming: Bool
     /// Final-turn metadata; nil while streaming.
     var meta: TurnMeta?
+    /// Milliseconds from request-send to first token rendered. Set the
+    /// instant the first SSE `token` event arrives; nil for messages that
+    /// only emitted tool calls or that came from a saved session.
+    var timeToFirstTokenMs: Int?
 
     init(role: ChatRole, text: String = "", isStreaming: Bool = false) {
         self.role = role
@@ -140,12 +144,13 @@ final class ChatSession {
         status = .thinking
 
         let sid = sessionId
+        let startedAt = Date()
         inFlight = Task { [weak self] in
             guard let self else { return }
             do {
                 for try await event in runtime.chat(message: trimmed, sessionId: sid) {
                     if Task.isCancelled { break }
-                    await MainActor.run { self.handle(event, into: asstMsg) }
+                    await MainActor.run { self.handle(event, into: asstMsg, startedAt: startedAt) }
                 }
                 await MainActor.run {
                     asstMsg.isStreaming = false
@@ -164,7 +169,7 @@ final class ChatSession {
     }
 
     @MainActor
-    private func handle(_ event: ChatEvent, into asstMsg: ChatMessage) {
+    private func handle(_ event: ChatEvent, into asstMsg: ChatMessage, startedAt: Date) {
         switch event {
         case .session(let id):
             chatLog.debug("evt session: \(id, privacy: .public)")
@@ -179,6 +184,9 @@ final class ChatSession {
             ))
         case .token(let text):
             chatLog.debug("evt token: \(text.count) chars")
+            if asstMsg.timeToFirstTokenMs == nil {
+                asstMsg.timeToFirstTokenMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+            }
             asstMsg.text.append(text)
         case .done(let done):
             chatLog.debug("evt done: \(done.completionTokens) tok, \(done.latencyMs)ms")

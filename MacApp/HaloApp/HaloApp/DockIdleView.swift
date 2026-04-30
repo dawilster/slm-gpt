@@ -19,7 +19,7 @@ struct DockIdleView: View {
             .padding(.top, 28).padding(.bottom, 22)
 
             DockInputRow(
-                placeholder: "Ask Halo…",
+                placeholder: "Ask Milo…",
                 showHints: true,
                 onSubmit: { _ in
                     // STUB: send prompt to the model. Flip to the thinking

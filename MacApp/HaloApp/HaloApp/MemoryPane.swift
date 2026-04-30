@@ -39,7 +39,7 @@ struct MemoryPane: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("WHAT HALO REMEMBERS")
+            Text("WHAT MILO REMEMBERS")
                 .font(.haloUI(10, weight: .semibold))
                 .tracking(0.8)
                 .foregroundStyle(Color.haloFgFaint)
@@ -77,7 +77,7 @@ struct MemoryPane: View {
             Text("Nothing remembered yet.")
                 .font(.haloUI(13, weight: .medium))
                 .foregroundStyle(Color.haloFg)
-            Text("Tell Halo something about yourself — preferences, your dog's name, where you live — and it'll save it here.")
+            Text("Tell Milo something about yourself — preferences, your dog's name, where you live — and it'll save it here.")
                 .font(.haloUI(12))
                 .foregroundStyle(Color.haloFgDim)
                 .multilineTextAlignment(.leading)

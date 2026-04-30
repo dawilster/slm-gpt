@@ -170,7 +170,7 @@ struct SettingsView: View {
             HotkeyRecorderView()
                 .padding(.bottom, 12)
 
-            Text("Press the hotkey from anywhere to bring Halo forward, and again to dismiss.")
+            Text("Press the hotkey from anywhere to bring Milo forward, and again to dismiss.")
                 .font(.haloUI(12))
                 .foregroundStyle(Color.haloFgDim)
                 .lineSpacing(2)

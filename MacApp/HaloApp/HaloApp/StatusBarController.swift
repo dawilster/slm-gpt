@@ -5,10 +5,18 @@ import Observation
 /// Custom NSStatusItem-based menubar controller. Replaces SwiftUI's
 /// MenuBarExtra so we can route left-click → custom dropdown panel and
 /// right-click → NSMenu with Quit, in the way macOS users expect.
+/// Borderless popover panel for the menubar dropdown. Needs the same
+/// canBecomeKey override as HaloDockPanel so click-outside actually
+/// resigns key (and our dismiss handler can fire).
+private final class StatusPanel: NSPanel {
+    override var canBecomeKey:  Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
 @MainActor
 final class StatusBarController: NSObject, NSWindowDelegate {
     private let statusItem: NSStatusItem
-    private let panel: NSPanel
+    private let panel: StatusPanel
     private let host: NSHostingView<AnyView>
 
     private let onSummon:      () -> Void
@@ -36,7 +44,7 @@ final class StatusBarController: NSObject, NSWindowDelegate {
 
         // Borderless panel — same visual style as the dock's NSPanel.
         let initialSize = NSSize(width: HaloMetrics.panelWidth, height: 460)
-        panel = NSPanel(
+        panel = StatusPanel(
             contentRect: NSRect(origin: .zero, size: initialSize),
             styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
             backing: .buffered,
@@ -119,7 +127,7 @@ final class StatusBarController: NSObject, NSWindowDelegate {
     private func showRightClickMenu() {
         let menu = NSMenu()
 
-        let summon = NSMenuItem(title: "Summon Halo", action: #selector(menuSummon), keyEquivalent: "")
+        let summon = NSMenuItem(title: "Summon Milo", action: #selector(menuSummon), keyEquivalent: "")
         summon.target = self
         menu.addItem(summon)
 
@@ -133,7 +141,7 @@ final class StatusBarController: NSObject, NSWindowDelegate {
 
         menu.addItem(.separator())
 
-        let quit = NSMenuItem(title: "Quit Halo", action: #selector(NSApp.terminate(_:)), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "Quit Milo", action: #selector(NSApp.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
         menu.addItem(quit)
 

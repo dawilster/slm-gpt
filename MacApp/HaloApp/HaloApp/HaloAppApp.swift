@@ -194,7 +194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 onClose: close
             )
             onboardingController = AuxiliaryWindowController(
-                title: "Welcome to Halo",
+                title: "Welcome to Milo",
                 content: AnyView(view.environment(AppState.shared)),
                 size: CGSize(width: HaloMetrics.dockWidth, height: 280)
             )
@@ -219,7 +219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 onClose: close
             )
             firstRunController = AuxiliaryWindowController(
-                title: "Setup Halo",
+                title: "Setup Milo",
                 content: AnyView(view.environment(AppState.shared)),
                 size: CGSize(width: HaloMetrics.dockWidth, height: 220)
             )
@@ -235,7 +235,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             let view = SettingsView(onClose: close)
             settingsController = AuxiliaryWindowController(
-                title: "Halo Settings",
+                title: "Milo Settings",
                 content: AnyView(view.environment(AppState.shared)),
                 size: CGSize(width: HaloMetrics.dockWidth, height: 480)
             )

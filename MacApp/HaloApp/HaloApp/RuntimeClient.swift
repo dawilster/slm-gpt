@@ -334,7 +334,7 @@ enum RuntimeError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .notReachable:        return "Halo runtime daemon isn't reachable. Run `bun run server` in the project."
+        case .notReachable:        return "Milo runtime daemon isn't reachable. Run `bun run server` in the project."
         case .httpStatus(let s):   return "Runtime returned HTTP \(s)."
         }
     }

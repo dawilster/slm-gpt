@@ -52,7 +52,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     func postReply(_ text: String) {
         log.debug("postReply: \(text.count) chars")
         let content = UNMutableNotificationContent()
-        content.title = "Halo replied"
+        content.title = "Milo replied"
         content.body  = String(text.prefix(240))
         content.sound = .default
         content.categoryIdentifier = Notifier.categoryId

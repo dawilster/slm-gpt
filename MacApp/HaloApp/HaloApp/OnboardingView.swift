@@ -25,7 +25,7 @@ struct OnboardingView: View {
                 HStack(alignment: .top, spacing: 22) {
                     HaloOrb(size: 56, state: .idle).padding(.top, 4)
                     VStack(alignment: .leading, spacing: 0) {
-                        Text("Pick how you summon Halo.")
+                        Text("Pick how you summon Milo.")
                             .font(.haloUI(22, weight: .semibold))
                             .tracking(-0.44)
                             .padding(.bottom, 8)
