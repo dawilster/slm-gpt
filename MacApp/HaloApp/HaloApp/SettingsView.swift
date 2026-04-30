@@ -2,6 +2,7 @@ import SwiftUI
 
 /// Two-pane settings window: sidebar nav + content.
 struct SettingsView: View {
+    var onClose: () -> Void = {}
     @State private var selected: SettingsSection = .model
 
     var body: some View {
@@ -16,10 +17,16 @@ struct SettingsView: View {
                 .frame(minHeight: 380)
             }
         }
+        .onKeyPress(.escape) {
+            onClose()
+            return .handled
+        }
     }
 
     private var header: some View {
         HStack(spacing: 10) {
+            WindowCloseButton(action: onClose)
+                .padding(.trailing, 4)
             HaloOrb(size: 20, state: .idle)
             Text("Settings").font(.haloUI(13, weight: .semibold))
             Spacer(minLength: 0)
@@ -27,7 +34,7 @@ struct SettingsView: View {
                 .font(.haloMono(10.5))
                 .foregroundStyle(Color.haloFgFaint)
         }
-        .padding(.horizontal, 18).padding(.top, 14).padding(.bottom, 10)
+        .padding(.horizontal, 14).padding(.top, 14).padding(.bottom, 10)
         .overlay(alignment: .bottom) {
             Rectangle().fill(Color.white.opacity(0.06)).frame(height: 0.5)
         }

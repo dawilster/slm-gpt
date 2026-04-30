@@ -5,6 +5,7 @@ import SwiftUI
 struct OnboardingView: View {
     var onContinue: () -> Void = {}
     var onTryNow: () -> Void = {}
+    var onClose: () -> Void = {}
 
     private struct Step { let label: String; let state: State
         enum State { case done, active, todo }
@@ -48,6 +49,14 @@ struct OnboardingView: View {
                 }
             }
             .padding(.horizontal, 32).padding(.top, 30).padding(.bottom, 26)
+        }
+        .overlay(alignment: .topLeading) {
+            WindowCloseButton(action: onClose)
+                .padding(14)
+        }
+        .onKeyPress(.escape) {
+            onClose()
+            return .handled
         }
     }
 

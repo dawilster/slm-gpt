@@ -264,3 +264,39 @@ struct VRule: View {
         Rectangle().fill(Color.white.opacity(0.12)).frame(width: 1, height: height)
     }
 }
+
+// MARK: - Borderless-window close button
+
+/// Traffic-light–style close button. The × glyph appears on hover so the
+/// idle state stays visually quiet, matching macOS native chrome.
+struct WindowCloseButton: View {
+    let action: () -> Void
+
+    @State private var hovered = false
+    @State private var pressed = false
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Circle()
+                    .fill(Color(red: 1.00, green: 0.37, blue: 0.36))
+                    .overlay(Circle().stroke(Color.black.opacity(0.18), lineWidth: 0.5))
+                if hovered {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 7.5, weight: .bold))
+                        .foregroundStyle(Color.black.opacity(0.65))
+                }
+            }
+            .frame(width: 12, height: 12)
+            .scaleEffect(pressed ? 0.92 : 1.0)
+            .animation(.easeOut(duration: 0.08), value: pressed)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { _ in pressed = true }
+                .onEnded   { _ in pressed = false }
+        )
+    }
+}

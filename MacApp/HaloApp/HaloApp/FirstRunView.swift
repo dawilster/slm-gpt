@@ -4,6 +4,7 @@ import SwiftUI
 /// STUB: progress is a timer; wire to real download when runtime lands.
 struct FirstRunView: View {
     var onDone: () -> Void = {}
+    var onClose: () -> Void = {}
 
     @State private var progress: Double = 0.616 // matches design ~61.6%
     @State private var timer: Timer? = nil
@@ -53,6 +54,14 @@ struct FirstRunView: View {
                 }
             }
             .padding(.horizontal, 28).padding(.top, 26).padding(.bottom, 22)
+        }
+        .overlay(alignment: .topLeading) {
+            WindowCloseButton(action: onClose)
+                .padding(14)
+        }
+        .onKeyPress(.escape) {
+            onClose()
+            return .handled
         }
         .onAppear { startTimer() }
         .onDisappear { timer?.invalidate() }

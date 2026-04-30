@@ -80,10 +80,19 @@ struct HotkeyRecorderView: View {
 
     private func startRecording() {
         recording = true
+        state.isRecordingHotkey = true
         // Local monitor so we capture keys while focus is in our process.
         monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { event in
             // Ignore pure modifier-only flag changes.
             guard event.type == .keyDown else { return event }
+
+            // Escape cancels recording (and is swallowed so the surrounding
+            // window's onKeyPress(.escape) doesn't dismiss it).
+            if Int(event.keyCode) == kVK_Escape {
+                stopRecording()
+                return nil
+            }
+
             let cocoaMods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             let modifiers = Hotkey.carbonFlags(from: cocoaMods)
 
@@ -99,6 +108,7 @@ struct HotkeyRecorderView: View {
 
     private func stopRecording() {
         recording = false
+        state.isRecordingHotkey = false
         if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
     }
 

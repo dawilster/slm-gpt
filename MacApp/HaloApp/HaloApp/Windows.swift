@@ -20,11 +20,14 @@ final class HaloKeyableWindow: NSWindow {
 
 /// Bottom-anchored summoned chat dock. Borderless, transparent, floats above
 /// other windows, joins all spaces, draggable by background, dismisses on click
-/// outside (resign-key).
+/// outside. Position is persisted across summons after the user moves it.
 final class DockWindowController: NSObject, NSWindowDelegate {
     let panel: HaloDockPanel
     private let state: AppState
     private let host: NSHostingView<AnyView>
+
+    /// UserDefaults key for the dragged position.
+    private static let originKey = "halo.dock.origin"
 
     init(state: AppState) {
         self.state = state
@@ -39,18 +42,17 @@ final class DockWindowController: NSObject, NSWindowDelegate {
         panel.backgroundColor = .clear
         panel.level = .floating
         panel.hasShadow = true
-        panel.isMovableByWindowBackground = true                // <- draggable
+        panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
-        panel.becomesKeyOnlyIfNeeded = false                    // text input focuses immediately
+        panel.becomesKeyOnlyIfNeeded = false
         panel.isReleasedWhenClosed = false
         panel.isMovable = true
         panel.hidesOnDeactivate = false
 
         self.panel = panel
 
-        // SwiftUI host with state injected — view re-renders when state changes.
         let initialView = AnyView(DockHost().environment(state))
         self.host = NSHostingView(rootView: initialView)
         host.translatesAutoresizingMaskIntoConstraints = false
@@ -62,6 +64,11 @@ final class DockWindowController: NSObject, NSWindowDelegate {
         let container = NSView()
         container.wantsLayer = true
         container.layer?.backgroundColor = .clear
+        // Clip at the OS compositor so NSVisualEffectView's stroke/edge can't
+        // leak past the rounded SwiftUI shape.
+        container.layer?.cornerRadius = HaloMetrics.dockCornerRadius
+        container.layer?.cornerCurve = .continuous
+        container.layer?.masksToBounds = true
         container.addSubview(host)
         NSLayoutConstraint.activate([
             host.leadingAnchor.constraint(equalTo: container.leadingAnchor),
@@ -72,18 +79,23 @@ final class DockWindowController: NSObject, NSWindowDelegate {
         panel.contentView = container
     }
 
-    func showAtBottomCenter() {
+    /// Show — at the saved origin if present, otherwise centered above the dock.
+    func summon() {
         refreshContent()
         let fittingSize = host.fittingSize
-        guard let screen = NSScreen.main else {
-            panel.setContentSize(fittingSize)
-            panel.makeKeyAndOrderFront(nil)
-            return
-        }
-        let frame = screen.visibleFrame
         let w = max(HaloMetrics.dockWidth, fittingSize.width)
         let h = max(60, fittingSize.height)
-        let origin = NSPoint(x: frame.midX - w / 2, y: frame.minY + 28)
+
+        let origin: NSPoint = {
+            if let saved = DockWindowController.loadOrigin(),
+               DockWindowController.originIsOnScreen(saved, size: CGSize(width: w, height: h)) {
+                return saved
+            }
+            guard let screen = NSScreen.main else { return .zero }
+            let frame = screen.visibleFrame
+            return NSPoint(x: frame.midX - w / 2, y: frame.minY + 28)
+        }()
+
         panel.setFrame(NSRect(origin: origin, size: CGSize(width: w, height: h)),
                        display: true, animate: false)
         NSApp.activate(ignoringOtherApps: true)
@@ -98,10 +110,36 @@ final class DockWindowController: NSObject, NSWindowDelegate {
         host.rootView = AnyView(DockHost().environment(state))
     }
 
-    // MARK: NSWindowDelegate — click outside dismisses.
+    // MARK: NSWindowDelegate
+
+    /// Click outside dismisses.
     func windowDidResignKey(_ notification: Notification) {
-        // Defer so any in-flight click on a child control completes first.
         DispatchQueue.main.async { [weak self] in self?.dismiss() }
+    }
+
+    /// User dragged the dock — remember the new origin so the next summon
+    /// reuses it.
+    func windowDidMove(_ notification: Notification) {
+        DockWindowController.saveOrigin(panel.frame.origin)
+    }
+
+    // MARK: - Position persistence
+
+    private static func saveOrigin(_ origin: NSPoint) {
+        UserDefaults.standard.set([origin.x, origin.y], forKey: originKey)
+    }
+
+    private static func loadOrigin() -> NSPoint? {
+        guard let arr = UserDefaults.standard.array(forKey: originKey) as? [Double],
+              arr.count == 2 else { return nil }
+        return NSPoint(x: arr[0], y: arr[1])
+    }
+
+    /// Discard a saved origin if the screen layout has changed and it would
+    /// land off-screen (external display unplugged, etc.).
+    private static func originIsOnScreen(_ origin: NSPoint, size: CGSize) -> Bool {
+        let rect = NSRect(origin: origin, size: size)
+        return NSScreen.screens.contains { $0.visibleFrame.intersects(rect) }
     }
 }
 
@@ -119,7 +157,6 @@ private struct DockHost: View {
             }
         }
         .onKeyPress(.escape) {
-            // Reset to idle and dismiss the panel on escape.
             state.dockScreen = .idle
             state.menubarState = .idle
             NSApp.keyWindow?.orderOut(nil)
@@ -148,7 +185,8 @@ final class AuxiliaryWindowController: NSObject {
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.title = title
-        window.level = .normal
+        window.level = .floating       // accessory apps need this so windows
+                                       // don't end up behind other apps
         window.isReleasedWhenClosed = false
 
         let host = NSHostingView(rootView: content.frame(width: HaloMetrics.dockWidth))
@@ -157,6 +195,9 @@ final class AuxiliaryWindowController: NSObject {
         let container = NSView()
         container.wantsLayer = true
         container.layer?.backgroundColor = .clear
+        container.layer?.cornerRadius = HaloMetrics.dockCornerRadius
+        container.layer?.cornerCurve = .continuous
+        container.layer?.masksToBounds = true
         container.addSubview(host)
         NSLayoutConstraint.activate([
             host.leadingAnchor.constraint(equalTo: container.leadingAnchor),
@@ -170,9 +211,11 @@ final class AuxiliaryWindowController: NSObject {
     }
 
     func show() {
-        window.center()
-        window.makeKeyAndOrderFront(nil)
+        // Activate first so the window comes forward in an accessory app.
         NSApp.activate(ignoringOtherApps: true)
+        window.center()
+        window.orderFrontRegardless()
+        window.makeKeyAndOrderFront(nil)
     }
 
     func close() {

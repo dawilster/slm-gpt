@@ -5,13 +5,13 @@ import AppKit
 struct HaloAppApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
-    // Shared between the menubar panel and the floating windows.
-    @State private var state = AppState()
+    // Singleton — same instance the AppDelegate registers the hotkey against.
+    @State private var state = AppState.shared
 
     var body: some Scene {
         MenuBarExtra {
             MenubarPanelView(
-                onSummon:    { appDelegate.showDock() },
+                onSummon:    { appDelegate.toggleDock() },
                 onSettings:  { appDelegate.showSettings() },
                 onRunSetup:  { appDelegate.runSetup() },
                 onCycleDock: {
@@ -20,9 +20,6 @@ struct HaloAppApp: App {
                 }
             )
             .environment(state)
-            .onAppear {
-                appDelegate.state = state
-            }
         } label: {
             // SwiftUI animations don't drive a view embedded in MenuBarExtra's
             // label, so the glyph is snapshotted per state.
@@ -35,10 +32,6 @@ struct HaloAppApp: App {
 // MARK: - App delegate — owns the floating windows + global hotkey
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    var state: AppState? {
-        didSet { wireHotkeyChanges() }
-    }
-
     private var dockController: DockWindowController?
     private var onboardingController: AuxiliaryWindowController?
     private var firstRunController:   AuxiliaryWindowController?
@@ -50,32 +43,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Menubar accessory — no Dock icon, no main window.
         NSApp.setActivationPolicy(.accessory)
 
-        DispatchQueue.main.async { [weak self] in
-            guard let self, let state = self.state else { return }
+        let state = AppState.shared
+        state.onHotkeyChange = { [weak self] new in self?.registerHotkey(new) }
+        registerHotkey(state.hotkey)
 
-            // Register global hotkey.
-            self.registerHotkey(state.hotkey)
-
-            // First launch flow.
-            if !state.hasCompletedOnboarding {
-                self.showOnboarding()
-            } else if !state.hasCompletedFirstRun {
-                self.showFirstRun()
-            }
+        // First-launch flow.
+        if !state.hasCompletedOnboarding {
+            showOnboarding()
+        } else if !state.hasCompletedFirstRun {
+            showFirstRun()
         }
     }
 
     // MARK: Hotkey
 
-    private func wireHotkeyChanges() {
-        state?.onHotkeyChange = { [weak self] new in self?.registerHotkey(new) }
-    }
-
     private func registerHotkey(_ hotkey: Hotkey) {
-        hotkeyManager.register(hotkey) { [weak self] in self?.toggleDock() }
+        hotkeyManager.register(hotkey) { [weak self] in
+            // Skip the dock toggle if the user is recording a new hotkey —
+            // the recorder's local NSEvent monitor needs to win the keypress.
+            guard !AppState.shared.isRecordingHotkey else { return }
+            self?.toggleDock()
+        }
     }
 
-    /// Hotkey behavior — visible dock dismisses, hidden dock summons.
+    /// Hotkey + Summon button behavior — visible dock dismisses, hidden summons.
     func toggleDock() {
         if let dock = dockController, dock.panel.isVisible {
             dock.dismiss()
@@ -87,11 +78,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Dock (bottom-anchored summoned chat)
 
     func showDock() {
-        guard let state else { return }
         if dockController == nil {
-            dockController = DockWindowController(state: state)
+            dockController = DockWindowController(state: AppState.shared)
         }
-        dockController?.showAtBottomCenter()
+        dockController?.summon()
     }
 
     func refreshDockIfVisible() {
@@ -101,31 +91,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Setup flow
 
     func runSetup() {
-        state?.hasCompletedOnboarding = false
-        state?.hasCompletedFirstRun = false
+        AppState.shared.hasCompletedOnboarding = false
+        AppState.shared.hasCompletedFirstRun = false
         showOnboarding()
     }
 
     func showOnboarding() {
-        guard let state else { return }
         if onboardingController == nil {
+            let close: () -> Void = { [weak self] in
+                self?.onboardingController?.close()
+                self?.onboardingController = nil
+            }
             let view = OnboardingView(
                 onContinue: { [weak self] in
-                    self?.state?.hasCompletedOnboarding = true
-                    self?.onboardingController?.close()
-                    self?.onboardingController = nil
+                    AppState.shared.hasCompletedOnboarding = true
+                    close()
                     self?.showFirstRun()
                 },
                 onTryNow: { [weak self] in
-                    self?.state?.hasCompletedOnboarding = true
-                    self?.onboardingController?.close()
-                    self?.onboardingController = nil
+                    AppState.shared.hasCompletedOnboarding = true
+                    close()
                     self?.showDock()
-                }
+                },
+                onClose: close
             )
             onboardingController = AuxiliaryWindowController(
                 title: "Welcome to Halo",
-                content: AnyView(view.environment(state)),
+                content: AnyView(view.environment(AppState.shared)),
                 size: CGSize(width: HaloMetrics.dockWidth, height: 280)
             )
         }
@@ -133,16 +125,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func showFirstRun() {
-        guard let state else { return }
         if firstRunController == nil {
-            let view = FirstRunView(onDone: { [weak self] in
-                self?.state?.hasCompletedFirstRun = true
+            let close: () -> Void = { [weak self] in
                 self?.firstRunController?.close()
                 self?.firstRunController = nil
-            })
+            }
+            let view = FirstRunView(
+                onDone: { [weak self] in
+                    AppState.shared.hasCompletedFirstRun = true
+                    close()
+                    _ = self
+                },
+                onClose: close
+            )
             firstRunController = AuxiliaryWindowController(
                 title: "Setup Halo",
-                content: AnyView(view.environment(state)),
+                content: AnyView(view.environment(AppState.shared)),
                 size: CGSize(width: HaloMetrics.dockWidth, height: 220)
             )
         }
@@ -150,11 +148,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func showSettings() {
-        guard let state else { return }
         if settingsController == nil {
+            let close: () -> Void = { [weak self] in
+                self?.settingsController?.close()
+                self?.settingsController = nil
+            }
+            let view = SettingsView(onClose: close)
             settingsController = AuxiliaryWindowController(
                 title: "Halo Settings",
-                content: AnyView(SettingsView().environment(state)),
+                content: AnyView(view.environment(AppState.shared)),
                 size: CGSize(width: HaloMetrics.dockWidth, height: 480)
             )
         }

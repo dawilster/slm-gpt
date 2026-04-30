@@ -16,8 +16,13 @@ enum DockScreen: String, CaseIterable, Identifiable {
     }
 }
 
+/// Singleton — both AppDelegate (at applicationDidFinishLaunching) and the
+/// SwiftUI scenes (via @Environment) talk to the same instance, which avoids
+/// a window-of-time at launch where each held different references.
 @Observable
 final class AppState {
+    static let shared = AppState()
+
     var menubarState: HaloMenubarState = .idle
     var dockScreen: DockScreen = .idle
 
@@ -27,10 +32,15 @@ final class AppState {
         didSet { persistHotkey(); onHotkeyChange?(hotkey) }
     }
 
+    /// True while the user is capturing a new hotkey in Settings or
+    /// Onboarding — the global hotkey handler skips its action so the
+    /// recorder's local NSEvent monitor wins the keypress.
+    var isRecordingHotkey: Bool = false
+
     /// Set by AppDelegate so AppState can re-register the hotkey on change.
     var onHotkeyChange: ((Hotkey) -> Void)?
 
-    init() {
+    private init() {
         self.hotkey = AppState.loadHotkey() ?? .default
     }
 
