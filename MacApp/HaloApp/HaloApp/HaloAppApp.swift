@@ -9,29 +9,17 @@ struct HaloAppApp: App {
     @State private var state = AppState.shared
 
     var body: some Scene {
-        MenuBarExtra {
-            MenubarPanelView(
-                onSummon:    { appDelegate.toggleDock() },
-                onSettings:  { appDelegate.showSettings() },
-                onRunSetup:  { appDelegate.runSetup() },
-                onCycleDock: {
-                    state.cycleDock()
-                    appDelegate.refreshDockIfVisible()
-                }
-            )
-            .environment(state)
-        } label: {
-            // SwiftUI animations don't drive a view embedded in MenuBarExtra's
-            // label, so the glyph is snapshotted per state.
-            Image(nsImage: HaloMark.menubarImage(state: state.menubarState))
-        }
-        .menuBarExtraStyle(.window)
+        // No SwiftUI scenes — the menubar surface is a custom NSStatusItem
+        // (StatusBarController) so we can route left-click vs right-click
+        // independently. Auxiliary windows are created by AppDelegate.
+        Settings { EmptyView() }
     }
 }
 
 // MARK: - App delegate — owns the floating windows + global hotkey
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var statusBar: StatusBarController?
     private var dockController: DockWindowController?
     private var onboardingController: AuxiliaryWindowController?
     private var firstRunController:   AuxiliaryWindowController?
@@ -46,6 +34,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let state = AppState.shared
         state.onHotkeyChange = { [weak self] new in self?.registerHotkey(new) }
         registerHotkey(state.hotkey)
+
+        // Custom NSStatusItem-based menubar surface. Handles left-click
+        // (dropdown) + right-click (Quit menu) independently.
+        statusBar = StatusBarController(
+            state: state,
+            onSummon:    { [weak self] in self?.toggleDock() },
+            onSettings:  { [weak self] in self?.showSettings() },
+            onRunSetup:  { [weak self] in self?.runSetup() },
+            onCycleDock: { [weak self] in
+                state.cycleDock()
+                self?.refreshDockIfVisible()
+            },
+            onOpenSession: { [weak self] id in self?.openSession(id) }
+        )
+
+        // Banner notifications when replies land while the dock is hidden.
+        Notifier.shared.bootstrap()
 
         // Periodic runtime health probe — drives the "Ready / Offline" status
         // in the dock and the menubar dropdown.
@@ -63,21 +68,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startHealthProbe() {
         Task { await self.probeOnce() }
-        healthTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { _ in
+        // .common mode → fires through menu tracking. The default mode pauses
+        // while the menubar popover is open, which is exactly when the user
+        // is most likely to look at the connection state.
+        let timer = Timer(timeInterval: 3.0, repeats: true) { _ in
             Task { @MainActor in await AppDelegate.shared?.probeOnce() }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        healthTimer = timer
     }
 
     @MainActor
     private func probeOnce() async {
         do {
             let h = try await RuntimeClient.shared.health()
-            AppState.shared.runtimeStatus = RuntimeStatus(
+            let next = RuntimeStatus(
                 connected:   true,
                 modelLabel:  h.model,
                 contextHint: h.contextLimit.map { "\($0/1024)K ctx" }
             )
+            if AppState.shared.runtimeStatus != next {
+                AppState.shared.runtimeStatus = next
+            }
         } catch {
+            // Always set on transition to offline — prior code only set it
+            // when previously connected, which was correct but subtle.
             if AppState.shared.runtimeStatus.connected {
                 AppState.shared.runtimeStatus = .offline
             }
@@ -111,10 +126,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Dock (bottom-anchored summoned chat)
 
     func showDock() {
+        // Reset the chat if it's been idle long enough — so a new summon
+        // after a coffee break gives the user a clean canvas.
+        AppState.shared.chat.markSummoned()
         if dockController == nil {
             dockController = DockWindowController(state: AppState.shared)
         }
         dockController?.summon()
+    }
+
+    /// Whether the floating chat dock is currently visible on screen.
+    /// Read by ChatSession to decide whether a completed turn should
+    /// surface as a banner notification or just stay in the open window.
+    var isDockVisible: Bool {
+        dockController?.panel.isVisible ?? false
+    }
+
+    /// Load an existing conversation by id and reopen the dock to show it.
+    /// Bypasses ChatSession.markSummoned so we don't accidentally idle-reset
+    /// the conversation we're trying to load.
+    func openSession(_ id: String) {
+        Task { @MainActor in
+            do {
+                let detail = try await RuntimeClient.shared.session(id: id)
+                AppState.shared.chat.load(detail)
+                if dockController == nil {
+                    dockController = DockWindowController(state: AppState.shared)
+                }
+                dockController?.summon()
+            } catch {
+                // If load fails, fall back to a plain summon — better than
+                // doing nothing.
+                showDock()
+            }
+        }
     }
 
     func refreshDockIfVisible() {
@@ -167,7 +212,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 onDone: { [weak self] in
                     AppState.shared.hasCompletedFirstRun = true
                     close()
-                    _ = self
+                    // Setup is finished — drop the user straight into a fresh
+                    // chat so they don't have to find the menubar themselves.
+                    self?.showDock()
                 },
                 onClose: close
             )

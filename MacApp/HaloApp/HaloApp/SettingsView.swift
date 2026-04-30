@@ -27,7 +27,6 @@ struct SettingsView: View {
         HStack(spacing: 10) {
             WindowCloseButton(action: onClose)
                 .padding(.trailing, 4)
-            HaloOrb(size: 20, state: .idle)
             Text("Settings").font(.haloUI(13, weight: .semibold))
             Spacer(minLength: 0)
             Text("v1.0.4")

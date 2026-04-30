@@ -218,6 +218,24 @@ const server = Bun.serve({
       return json({ sessions: list });
     }
 
+    // GET /v1/sessions/<id> — full transcript (user + assistant messages
+    // only; system + tool turns are internal and not displayed).
+    if (req.method === "GET" && url.pathname.startsWith("/v1/sessions/")) {
+      const idOrPrefix = decodeURIComponent(url.pathname.slice("/v1/sessions/".length));
+      const id = await store.findByPrefix(idOrPrefix);
+      if (!id) return json({ error: "session not found" }, { status: 404 });
+      const turns = await store.loadTurns(id);
+      const messages = turns
+        .filter((t) => t.role === "user" || t.role === "assistant")
+        .map((t) => ({
+          role: t.role as "user" | "assistant",
+          text: t.content,
+          ts: t.ts,
+        }));
+      const meta = await store.metadataFor(id);
+      return json({ id, messages, meta });
+    }
+
     // GET /v1/profile — what the assistant remembers about the user.
     if (req.method === "GET" && url.pathname === "/v1/profile") {
       const facts = profile.entries().map(([key, value]) => ({ key, value }));

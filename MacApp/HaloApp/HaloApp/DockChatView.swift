@@ -25,7 +25,9 @@ struct DockChatView: View {
                     .padding(.top, 18).padding(.bottom, 14)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxHeight: 420)
+                // No fixed maxHeight — the SwiftUI content sizes itself
+                // naturally, the surrounding NSPanel grows to match
+                // (capped at 75% of the screen by DockWindowController).
                 .onChange(of: state.chat.messages.count) { _, _ in
                     if let last = state.chat.messages.last {
                         withAnimation(.easeOut(duration: 0.2)) {
@@ -143,47 +145,58 @@ private struct MessageRow: View {
                     .frame(maxWidth: 0.85 * HaloMetrics.dockWidth, alignment: .trailing)
             }
         } else {
-            HStack(alignment: .top, spacing: 12) {
-                HaloOrb(size: 22, state: message.isStreaming ? .thinking : .idle)
-                    .padding(.top, 3)
-                VStack(alignment: .leading, spacing: 8) {
-                    if !message.toolCalls.isEmpty {
-                        VStack(spacing: 0) {
-                            ForEach(message.toolCalls) { trace in
-                                ToolCallRow(trace: trace,
-                                            isLast: trace.id == message.toolCalls.last?.id)
-                            }
+            VStack(alignment: .leading, spacing: 8) {
+                if !message.toolCalls.isEmpty {
+                    VStack(spacing: 0) {
+                        ForEach(message.toolCalls) { trace in
+                            ToolCallRow(trace: trace,
+                                        isLast: trace.id == message.toolCalls.last?.id)
                         }
-                        .background(Color.white.opacity(0.02))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
-
-                    if !message.text.isEmpty {
-                        replyText
-                    } else if message.isStreaming && message.toolCalls.isEmpty {
-                        // Pre-token "thinking…" placeholder.
-                        Text("Thinking…")
-                            .font(.haloUI(15))
-                            .foregroundStyle(Color.haloFgFaint)
-                    }
+                    .background(Color.white.opacity(0.02))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+
+                if !message.text.isEmpty {
+                    replyText
+                } else if message.isStreaming && message.toolCalls.isEmpty {
+                    ThinkingIndicator()
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
     @ViewBuilder
     private var replyText: some View {
-        let displayText = message.text + (message.isStreaming ? "▍" : "")
-        Text(displayText)
-            .font(.haloUI(15))
-            .foregroundStyle(Color.haloFg)
-            .lineSpacing(3)
+        MarkdownText(text: message.text, isStreaming: message.isStreaming)
             .textSelection(.enabled)
+    }
+}
+
+// MARK: - Animated thinking indicator (cycling dots)
+
+/// "Thinking" with three dots fading in 0 → 3 → 0 every ~1.6s.
+/// Each dot is always laid out so the indicator's width never shifts.
+private struct ThinkingIndicator: View {
+    private static let step: TimeInterval = 0.4
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: Self.step)) { context in
+            let phase = Int(context.date.timeIntervalSinceReferenceDate / Self.step) % 4
+            HStack(spacing: 1) {
+                Text("Thinking")
+                ForEach(0..<3, id: \.self) { i in
+                    Text(".").opacity(i < phase ? 1.0 : 0.20)
+                }
+            }
+            .font(.haloUI(15))
+            .foregroundStyle(Color.haloFgFaint)
+        }
     }
 }
 

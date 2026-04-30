@@ -42,6 +42,30 @@ struct ProfileResponse: Decodable, Sendable {
     let path: String
 }
 
+struct SessionMeta: Decodable, Identifiable, Sendable, Equatable {
+    let id: String
+    let path: String
+    let startedAt: String
+    let turnCount: Int
+    let firstUserMessage: String?
+}
+
+struct SessionsResponse: Decodable, Sendable {
+    let sessions: [SessionMeta]
+}
+
+struct SessionTurn: Decodable, Sendable, Equatable {
+    let role: String      // "user" | "assistant"
+    let text: String
+    let ts: String
+}
+
+struct SessionDetailResponse: Decodable, Sendable {
+    let id: String
+    let messages: [SessionTurn]
+    let meta: SessionMeta?
+}
+
 /// Yielded events from `RuntimeClient.chat`. The Mac app folds these into
 /// its `ChatSession` to drive the dock UI.
 enum ChatEvent: Sendable {
@@ -67,6 +91,29 @@ final class RuntimeClient {
         let override = UserDefaults.standard.string(forKey: "HALO_RUNTIME_URL")
             .flatMap(URL.init(string:))
         self.baseURL = baseURL ?? override ?? URL(string: "http://127.0.0.1:7878")!
+    }
+
+    /// Recent saved conversations, most-recent-first.
+    func sessions(limit: Int = 10) async throws -> [SessionMeta] {
+        var comps = URLComponents(url: baseURL.appendingPathComponent("v1/sessions"), resolvingAgainstBaseURL: false)!
+        comps.queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        let session = URLSession(configuration: .ephemeral)
+        let (data, resp) = try await session.data(from: comps.url!)
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+            throw RuntimeError.notReachable
+        }
+        return try JSONDecoder().decode(SessionsResponse.self, from: data).sessions
+    }
+
+    /// Full transcript for a session (user + assistant turns only).
+    func session(id: String) async throws -> SessionDetailResponse {
+        let url = baseURL.appendingPathComponent("v1/sessions/\(percentEncode(id))")
+        let session = URLSession(configuration: .ephemeral)
+        let (data, resp) = try await session.data(from: url)
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+            throw RuntimeError.notReachable
+        }
+        return try JSONDecoder().decode(SessionDetailResponse.self, from: data)
     }
 
     /// Fetch the user's profile — every fact the assistant has remembered.

@@ -1,4 +1,27 @@
 import SwiftUI
+import AppKit
+
+/// SwiftUI's MenuBarExtra(.window) wraps its popover in an NSWindow whose
+/// class name contains "MenuBarExtra". Order it out to dismiss.
+@MainActor
+func dismissMenubarPopover() {
+    for window in NSApp.windows {
+        let cls = String(describing: type(of: window))
+        if cls.contains("MenuBarExtra") {
+            window.orderOut(nil)
+        }
+    }
+}
+
+extension ISO8601DateFormatter {
+    /// Server emits timestamps with millisecond precision (e.g. 2026-04-30T...123Z),
+    /// which the default `.iso8601` parser rejects — opt into fractional seconds.
+    static let shared: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+}
 
 /// The dropdown panel that appears when the menubar icon is clicked.
 /// Hero status block + model card + recents + footer (Settings · History · Pause).
@@ -8,22 +31,13 @@ struct MenubarPanelView: View {
     var onSettings: () -> Void = {}
     var onRunSetup: () -> Void = {}
     var onCycleDock: () -> Void = {}
-
-    private struct Recent: Identifiable {
-        let id = UUID()
-        let title: String
-        let time: String
-    }
-
-    private let recents: [Recent] = [
-        .init(title: "Refactor the auth middleware", time: "2m"),
-        .init(title: "Summarize meeting notes from yesterday", time: "1h"),
-        .init(title: "Why is my SwiftUI list reloading?", time: "3h"),
-        .init(title: "Draft an email to the design team", time: "Yesterday"),
-    ]
+    /// Triggered when the user clicks a recent — caller loads and shows
+    /// that conversation. The String is the server-side session id.
+    var onOpenSession: (String) -> Void = { _ in }
 
     @State private var paused = false
     @State private var summonHovered = false
+    @State private var recents: [SessionMeta] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -34,12 +48,25 @@ struct MenubarPanelView: View {
             footer
         }
         .frame(width: HaloMetrics.panelWidth)
+        .background(
+            VisualEffectBackground(material: .hudWindow, blendingMode: .behindWindow)
+                .overlay(Color.haloBgDeep.opacity(0.30))
+        )
         .foregroundStyle(Color.haloFg)
+        .task { await loadRecents() }
         .contextMenu {
-            Button("Summon dock") { onSummon() }
+            Button("Summon dock") {
+                dismissMenubarPopover()
+                onSummon()
+            }
             Button("Cycle dock state") { onCycleDock() }
             Divider()
-            Button("Run setup again") { onRunSetup() }
+            Button("Run setup again") {
+                dismissMenubarPopover()
+                onRunSetup()
+            }
+            Divider()
+            Button("Quit Halo") { NSApp.terminate(nil) }
         }
     }
 
@@ -58,7 +85,10 @@ struct MenubarPanelView: View {
                         .foregroundStyle(Color.haloFgDim)
                 }
                 Spacer(minLength: 0)
-                Button(action: onSummon) {
+                Button(action: {
+                    dismissMenubarPopover()
+                    onSummon()
+                }) {
                     HStack(spacing: 4) {
                         Text("Summon").font(.haloUI(11, weight: .medium))
                         Text(state.hotkey.displayString)
@@ -119,25 +149,71 @@ struct MenubarPanelView: View {
                 .foregroundStyle(Color.haloFgFaint)
                 .padding(.bottom, 0)
 
-            VStack(spacing: 0) {
-                ForEach(Array(recents.enumerated()), id: \.element.id) { i, r in
-                    RecentRow(
-                        title: r.title,
-                        time: r.time,
-                        accent: i == 0,
-                        action: onSummon // STUB: load this conversation
-                    )
+            if recents.isEmpty {
+                Text("No conversations yet.")
+                    .font(.haloUI(11.5))
+                    .foregroundStyle(Color.haloFgFaint)
+                    .padding(.vertical, 6)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(recents.enumerated()), id: \.element.id) { i, meta in
+                        RecentRow(
+                            title: title(for: meta),
+                            time:  relativeTime(meta.startedAt),
+                            accent: i == 0,
+                            action: {
+                                dismissMenubarPopover()
+                                onOpenSession(meta.id)
+                            }
+                        )
+                    }
                 }
             }
         }
         .padding(.horizontal, 16).padding(.top, 10).padding(.bottom, 8)
     }
 
+    private func loadRecents() async {
+        do {
+            recents = try await RuntimeClient.shared.sessions(limit: 8)
+        } catch {
+            recents = []
+        }
+    }
+
+    /// Use the first user message as the title; fall back to the id stub.
+    private func title(for meta: SessionMeta) -> String {
+        if let m = meta.firstUserMessage, !m.isEmpty { return m }
+        return "Empty conversation"
+    }
+
+    /// "2m" / "1h" / "Yesterday" / "Mon" / "Apr 12"
+    private func relativeTime(_ iso: String) -> String {
+        guard let date = ISO8601DateFormatter.shared.date(from: iso) else { return "" }
+        let delta = Date().timeIntervalSince(date)
+        if delta < 60 { return "now" }
+        if delta < 3600 { return "\(Int(delta / 60))m" }
+        if delta < 86_400 { return "\(Int(delta / 3600))h" }
+        let days = Int(delta / 86_400)
+        if days == 1 { return "Yesterday" }
+        if days < 7 {
+            let f = DateFormatter()
+            f.dateFormat = "EEE"
+            return f.string(from: date)
+        }
+        let f = DateFormatter()
+        f.dateFormat = "MMM d"
+        return f.string(from: date)
+    }
+
     // MARK: - Footer (Settings · History + Pause)
 
     private var footer: some View {
         HStack {
-            FooterLink(text: "Settings", action: onSettings)
+            FooterLink(text: "Settings", action: {
+                dismissMenubarPopover()
+                onSettings()
+            })
             FooterLink(text: "History", action: { /* STUB: open history */ })
                 .padding(.leading, 6)
 

@@ -53,11 +53,18 @@ final class DockWindowController: NSObject, NSWindowDelegate {
 
         self.panel = panel
 
-        let initialView = AnyView(DockHost().environment(state))
-        self.host = NSHostingView(rootView: initialView)
+        // Empty placeholder until super.init unlocks self-capture.
+        self.host = NSHostingView(rootView: AnyView(EmptyView()))
         host.translatesAutoresizingMaskIntoConstraints = false
 
         super.init()
+
+        // Now safe to capture self in the size callback.
+        let view = DockHost(onContentHeightChange: { [weak self] h in
+            self?.contentHeightChanged(h)
+        })
+        .environment(state)
+        host.rootView = AnyView(view)
 
         panel.delegate = self
 
@@ -107,7 +114,32 @@ final class DockWindowController: NSObject, NSWindowDelegate {
     }
 
     func refreshContent() {
-        host.rootView = AnyView(DockHost().environment(state))
+        let view = DockHost(onContentHeightChange: { [weak self] h in
+            self?.contentHeightChanged(h)
+        })
+        .environment(state)
+        host.rootView = AnyView(view)
+    }
+
+    /// Called by the SwiftUI host whenever its intrinsic height changes.
+    /// Resizes the panel so the dock grows with the conversation, anchored
+    /// to the bottom edge so the input row stays put as messages pile up.
+    private func contentHeightChanged(_ height: CGFloat) {
+        guard panel.isVisible, height > 0 else { return }
+        let screenCap = (NSScreen.main?.visibleFrame.height ?? 800) * 0.75
+        let target = min(max(60, height), screenCap)
+
+        let oldFrame = panel.frame
+        if abs(target - oldFrame.height) < 1 { return }
+
+        // Keep bottom edge fixed (grow upward).
+        let newFrame = NSRect(
+            x: oldFrame.minX,
+            y: oldFrame.minY,
+            width: oldFrame.width,
+            height: target
+        )
+        panel.setFrame(newFrame, display: true, animate: false)
     }
 
     // MARK: NSWindowDelegate
@@ -148,6 +180,10 @@ final class DockWindowController: NSObject, NSWindowDelegate {
 /// shortcut/multi-step traces in the chat itself.
 private struct DockHost: View {
     @Environment(AppState.self) private var state
+    /// Called whenever the SwiftUI content's intrinsic height changes —
+    /// the controller resizes the NSPanel to match (anchored from the
+    /// bottom) so the chat grows upward as messages stream in.
+    var onContentHeightChange: (CGFloat) -> Void = { _ in }
 
     var body: some View {
         Group {
@@ -159,6 +195,15 @@ private struct DockHost: View {
                 DockShortcutView()
             }
         }
+        .background(
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear { onContentHeightChange(geo.size.height) }
+                    .onChange(of: geo.size.height) { _, new in
+                        onContentHeightChange(new)
+                    }
+            }
+        )
         .onKeyPress(.escape) {
             // If a turn is mid-flight, abort it and stay on the dock.
             if state.chat.status == .thinking {

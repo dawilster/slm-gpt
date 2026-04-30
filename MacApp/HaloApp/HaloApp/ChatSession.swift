@@ -57,6 +57,10 @@ enum ChatStatus: Equatable {
 
 @Observable
 final class ChatSession {
+    /// How long the dock can sit dismissed before the next summon starts a
+    /// fresh conversation instead of reopening the previous one.
+    static let idleResetWindow: TimeInterval = 60
+
     /// Server-assigned session id (echoed via the first SSE `session` event).
     /// Persists for the life of this conversation; `newConversation()` clears it.
     var sessionId: String?
@@ -70,12 +74,43 @@ final class ChatSession {
     /// Most recent done-event metadata, for the status strip.
     var lastTurnMeta: TurnMeta?
 
+    /// Tracks when the user last either sent something or summoned the dock,
+    /// so we can decide whether a re-summon should start fresh or continue.
+    private var lastInteractionAt: Date = .distantPast
+
     func newConversation() {
         cancel()
         sessionId = nil
         messages.removeAll()
         status = .ready
         lastTurnMeta = nil
+        lastInteractionAt = Date()
+    }
+
+    /// Called when the dock is summoned. If the conversation has been idle
+    /// for `idleResetWindow`, start a clean chat — keeps long-forgotten
+    /// conversations from polluting context when the user comes back later.
+    func markSummoned() {
+        let now = Date()
+        if !messages.isEmpty,
+           now.timeIntervalSince(lastInteractionAt) > Self.idleResetWindow {
+            chatLog.debug("idle reset (>\(Self.idleResetWindow, privacy: .public)s) — starting new chat")
+            newConversation()
+        }
+        lastInteractionAt = now
+    }
+
+    /// Replace the current conversation with one loaded from the daemon.
+    func load(_ detail: SessionDetailResponse) {
+        cancel()
+        sessionId = detail.id
+        messages = detail.messages.map {
+            let role: ChatRole = $0.role == "user" ? .user : .assistant
+            return ChatMessage(role: role, text: $0.text, isStreaming: false)
+        }
+        status = .ready
+        lastTurnMeta = nil
+        lastInteractionAt = Date()
     }
 
     func cancel() {
@@ -96,6 +131,7 @@ final class ChatSession {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         cancel()
+        lastInteractionAt = Date()
 
         let userMsg = ChatMessage(role: .user, text: trimmed)
         let asstMsg = ChatMessage(role: .assistant, text: "", isStreaming: true)
@@ -157,6 +193,14 @@ final class ChatSession {
             asstMsg.isStreaming = false
             lastTurnMeta = meta
             sessionId = done.sessionId
+
+            // If the user dismissed the dock while we were generating,
+            // surface the reply as a banner so they don't miss it.
+            let dockVisible = AppDelegate.shared?.isDockVisible ?? false
+            chatLog.debug("done: dockVisible=\(dockVisible), replyChars=\(asstMsg.text.count)")
+            if !dockVisible, !asstMsg.text.isEmpty {
+                Notifier.shared.postReply(asstMsg.text)
+            }
         case .error(let msg):
             chatLog.error("evt error: \(msg, privacy: .public)")
             asstMsg.isStreaming = false
