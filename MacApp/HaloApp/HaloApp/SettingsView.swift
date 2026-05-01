@@ -58,9 +58,10 @@ struct SettingsView: View {
     private var content: some View {
         VStack(alignment: .leading, spacing: 0) {
             switch selected {
-            case .model:  modelPane
-            case .memory: MemoryPane()
-            case .hotkey: hotkeyPane
+            case .model:     modelPane
+            case .memory:    MemoryPane()
+            case .shortcuts: ShortcutsPane()
+            case .hotkey:    hotkeyPane
             default:
                 Text(selected.label)
                     .font(.haloUI(13, weight: .medium))

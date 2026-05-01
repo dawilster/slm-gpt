@@ -151,6 +151,32 @@ Notifications respect system focus state — macOS Do Not Disturb / Focus modes 
 
 What lands first (when v9 ships): a notification helper + a daemon mode that wakes every N minutes to check a markdown task list. The task list itself is `~/.assistant/tasks/*.md` — same principle as memory in §3 (greppable, version-controllable, AI-readable).
 
+### 3.7 System bridge (Apple Shortcuts)
+
+The runtime needs a way to *act* on the user's machine — create reminders, fire timers, append to Notes, post to apps the assistant has no business writing custom adapters for. Apple Shortcuts is the existing surface: every macOS user already has a library of named, parameterised actions, and there's a `/usr/bin/shortcuts` CLI that runs them by name.
+
+**Architectural shape.** Two tools, not N. Exposing each shortcut as its own model-visible tool blows past the §5 tool-selection cliff almost immediately — a typical library is dozens of entries. Instead we mirror the `list_notes` / `read_note` pattern that's already proven at v4:
+
+- `list_shortcuts()` → newline-delimited names, for the model to discover what's available.
+- `run_shortcut(name, input?)` → runs `shortcuts run "<name>"`, pipes `input` via `-i <tmpfile>`, captures stdout. Output goes back as the tool result.
+
+That's a fixed +2 surface regardless of how big the user's library is.
+
+**Chaining.** No new mechanism needed. The agent loop in `assistant.ts` already iterates tool calls until the model emits a terminal text reply (verified at v4 with `list_notes → read_note`). "Make a note then set a timer" becomes two `run_shortcut` invocations across two iterations of the existing loop. The only adjustment: `DEFAULT_MAX_STEPS` bumps from 5 to 8 so longer chains don't trip the loop guard.
+
+**Graceful failure.** Reuse the v3.5 validate-and-retry primitive — `executeToolCall` returns errors that list available alternatives so the model self-corrects on the next loop iteration. Apply the same to shortcuts:
+
+- *Unknown name* → return `Error: shortcut '<X>' not found. Closest matches: …. Available: …`. The model retries with the corrected name on its next turn.
+- *Shortcut errors out* → return stderr verbatim prefixed with `Error:`. Model decides whether to tell the user, retry, or fall back.
+- *Hangs* → `AbortController` timeout (default 30s) → timeout-shaped error.
+- *First-run permission dialog* → macOS prompts the first time `shortcuts run` invokes a given shortcut. We catch the resulting failure and surface a one-line "approve in the dialog and re-ask" message, since the dialog is async to our process.
+
+**Listing in the UI.** `GET /v1/shortcuts` returns `{ shortcuts: [{name}], cachedAt }`. In-process cache (~30s TTL) so the Mac dock pane can repaint cheaply without re-spawning the CLI per render.
+
+**Trust posture (v6.5 ships with).** Trust the user's library wholesale. Shortcuts can do anything — send messages, hit APIs, delete files — but the user wrote them, and every invocation is already visible in the chat UI via the existing tool-event SSE stream. Revisit if the model misfires; an opt-in allowlist (`~/.assistant/shortcuts-allowed.json`) is the obvious next step but adds friction we don't yet need.
+
+**Tool-count tradeoff.** v4 shipped at 8 tools with a clean 30/30. v6.5 takes us to 10 — right at the §5 "8+" cliff. We accept that and watch the v4 regression suite for tool-selection drift. If it shows up, the weakest carrier in the existing set (`search_notes_by_filename` — semantically overlapping with `search_corpus`) is the natural drop candidate.
+
 ## 4. The Trajectory
 
 Each version introduces exactly one new mental model. We do not advance until the previous one is felt.
@@ -164,6 +190,7 @@ Each version introduces exactly one new mental model. We do not advance until th
 | **v4** | ✅ shipped | Multi-tool routing | 3–5 tools, tool selection, error handling | The capacity ceiling — how many tools before quality collapses |
 | **v5** | ✅ shipped | Profile (current truth) | Mutable key→value facts loaded into every system prompt; remember/forget tools | Separate facts from episodes; supersession at write-time, not retrieval-time |
 | **v6** | ✅ shipped (23/30 on practical eval — see §5 + §8 for the 1-point gap discussion) | Local RAG (episodic) | Embeddings, vector store, retrieval over notes + past sessions; per-chunk metadata layer (`source_mtime`, `content_date`, `intent`) for filtered retrieval | Retrieval-augmented generation; "knowing about X" vs "remembering X"; the cliff between retrieval-found and retrieval-skipped |
+| **v6.5** | future | System bridge (Apple Shortcuts) | `list_shortcuts` + `run_shortcut(name, input?)` over the macOS `shortcuts` CLI; fuzzy-match on unknown names; `GET /v1/shortcuts` for the Mac app | The runtime can reach *out* of the laptop via the user's existing Shortcuts library, without a tool-per-shortcut blowup |
 | **v7** | future | Web search | External tool, fetch + parse + summarize | Live data, source citation, latency |
 | **v8** | future | Model routing | Add a second tier (mid or frontier), `ModelClient` abstraction, routing policy, cost/latency logs | When to escalate, what the privacy boundary buys, the cost/quality/latency triangle |
 | **v9** | future | Scheduling / background | Cron-style triggers, notifications, persistent agent loop | The assistant runs even when I'm not looking |
@@ -241,6 +268,7 @@ Each version ships with a defined "done" — concrete, measurable, automatable.
 | v4 | Multi-tool test set: 30 prompts across 4 tools, ≥ 22 pick the right tool with valid args |
 | v5 | Profile: write 5/5, recall 5/5, supersession ≥2/3. Override (profile vs. recent-chat contradiction) tracked but ungated — inherently ambiguous. |
 | v6 | RAG test set: 30 questions over a known corpus, ≥ 24 retrieve a relevant passage AND incorporate it into the answer |
+| v6.5 | Shortcuts test set: 15 prompts (single run, two-step chain, unknown-name graceful, three-step chain). ≥ 12 produce the right `run_shortcut` call(s) with reasonable args; 100% of unknown-name cases return a fuzzy-match suggestion rather than a generic failure; v4 regression suite still ≥ 28/30 (no tool-selection drift). |
 | v7 | Web-search test set: 20 current-events questions, ≥ 14 produce a sourced, accurate answer |
 | v8 | Routing test set: 40 prompts hand-labeled with the correct tier; router picks correctly ≥ 32. Privacy regex is respected on 100% of synthetic sensitive prompts (zero leaks). Cost log is accurate to within 5%. |
 | v9 | Scheduled task fires on time, completes, and notifies; no zombie processes after restart |
@@ -382,6 +410,11 @@ Architectural choices, with reasons. So future-William remembers why.
 | 2026-04-29 | LM Studio KV cache quantization marked unusable on the current build (v0.4.12) | Empirically broken at both 8-bit and 4-bit: `NameError: name 'tree_reduce' is not defined` in the MLX runtime's quant path the moment a prompt crosses the activation threshold; subsequent worker crash. Single working data point (1K prompt) was below the quant threshold and therefore proves nothing. Disable until LM Studio updates; revisit then. Captured here so future-William doesn't repeat the experiment without checking the version. |
 | 2026-04-29 | v6 chunks carry per-row `source_mtime`, `content_date`, `intent`; `IndexStore.search` gains `intent` + `sinceMtime` filters | Forward-looking for the §3.6 Pebble pipeline — adding these now (alongside v6 ship) is one schema migration; threading them in later would mean re-indexing every chunk to backfill. Chunker populates `contentDate` for sessions only (where it's derivable from the turn timestamp); indexer denormalizes file mtime onto each chunk. `intent` stays null until the Pebble decompose step exists to produce it. Backwards-compatible ALTER on legacy DBs verified by `eval/index_metadata.ts`. |
 | 2026-04-29 | v6 ships at 23/30 on the practical RAG eval (one short of the ≥24/30 pass condition); retrieval-quality fixes deferred | The 1-point gap is two prompts where `search_corpus` ranked the wrong chunk first ("breakfast in Brisbane", "coffee for breakfast in Brisbane" — the Sourced Grocer session chunk was outranked by topical food/coffee notes). Three known fixes (bump K to 5, source-diversity in top-K, top-N re-rank) all have real trade-offs documented in §5. Deferring rather than picking arbitrarily — the right fix depends on usage patterns we don't have yet. Re-evaluate when (a) the corpus grows and the failure profile clarifies, or (b) the §3.6 Pebble pipeline lands and intent-filtered retrieval gives sharper signal about what queries should target what kinds of chunks. The v6 lessons (RAG mechanics, the model-discrimination cliff between "personal" and "general-knowledge" framings) are felt either way. |
+| 2026-05-01 | Shortcuts integration shipped as v6.5 (system bridge), not folded into v9 or v7 | Shortcuts is small (~one module + two tools), demonstrates the §5 tool-cliff explicitly (10 tools — first time we cross "8+"), and exercises the v3.5 retry primitive on a non-notes domain. Bundling it into v9's daemon work would conflate "act on the system" with "run on a schedule" — two separate concerns. Folding it into v7 would mix outbound *system* action with outbound *web* action, which have different trust profiles. Standalone v6.5 keeps the trajectory's "one mental model per version" discipline. |
+| 2026-05-01 | Shortcuts exposed as two tools (`list_shortcuts`, `run_shortcut`), not one tool per shortcut | A typical macOS Shortcuts library is dozens of entries. One-tool-per-shortcut would land us 30+ tools, well past the §5 selection cliff. The `list_notes` / `read_note` pattern proven at v4 (open-set keyed by name) is the right shape: small fixed surface, runtime discovery via the list call, error-on-miss includes the name set so the model can self-correct. |
+| 2026-05-01 | v6.5 ships with whole-library trust (no allowlist) | Shortcuts can do anything destructive the user's library is wired up to do. Two postures considered: (a) trust wholesale, rely on the existing tool-event SSE stream so every invocation is visible in the UI; (b) opt-in allowlist at `~/.assistant/shortcuts-allowed.json`. We pick (a) because the user wrote the shortcuts, the surface is already visible, and the friction of (b) is real — every new shortcut would need adding before the model could touch it. Revisit if the model materially misfires; (b) is a small follow-up, not a redesign. |
+| 2026-05-01 | `DEFAULT_MAX_STEPS` raised from 5 to 8 alongside v6.5 | Shortcut chains ("create a note, then set a timer, then add a reminder") realistically need 3–4 tool-call iterations plus the terminal text reply. 5 was tight even for v6's `list_notes → search_corpus → read_note` flows. 8 leaves headroom without making infinite-loop bugs invisible. |
+| 2026-05-01 | Dropped note-file CRUD tools (`read_note`, `list_notes`, `write_note`, `search_notes_by_filename`); note actions now route through Shortcuts | The user owns their notes ergonomics in Apple Notes (or whatever the "New Note" shortcut writes to), and that's where their existing reading/editing/search workflow lives. A second markdown-file CRUD surface inside the agent was always a parallel store the user had to remember to use. Cleanest is one write path: Shortcuts. Side effects: tool count drops from 10 → 6 (well below the §5 "8+" cliff — easier tool selection, less to mis-select); `~/.assistant/notes/` becomes import-only for `search_corpus` (RAG) — drop markdown there if you want it indexed; v4 multi-tool eval is now over a different toolset, so not directly comparable for regression checks. **Open seam:** notes the agent creates via the "New Note" shortcut land in Apple Notes' store, while `search_corpus` only sees `~/.assistant/notes/`. The agent can write but won't recall what it wrote — bridge candidates: (a) point the shortcut at a markdown file, (b) Apple Notes → markdown sync, (c) accept that "create a note" and "find a note" speak to different stores and document it. Defer until usage shows which way the user actually flows. |
 
 ## 9. Out of scope (for now)
 
@@ -399,4 +432,4 @@ These are deferred, not rejected. They land when their prerequisite work is in p
 
 ---
 
-*Last updated: 2026-04-29. Update at every architectural decision, every learned constraint, every shipped version.*
+*Last updated: 2026-05-01. Update at every architectural decision, every learned constraint, every shipped version.*

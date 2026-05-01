@@ -8,11 +8,10 @@
  * gets shipped to the model alongside each chat completion request.
  */
 
-import { readdir } from "node:fs/promises";
-import { normalize, resolve } from "node:path";
 import { Profile } from "./profile";
 import type { EmbeddingClient } from "./embeddings";
 import type { IndexStore, ScoredChunk } from "./index_store";
+import type { ShortcutsClient } from "./shortcuts";
 
 export type ToolDefinition = {
   name: string;
@@ -112,158 +111,6 @@ export const getCurrentTimeTool: Tool = {
   },
   execute: async () => new Date().toISOString(),
 };
-
-/**
- * Resolve a user-supplied filename against the notes root, refusing
- * parent traversal, absolute paths, and any resolved path that escapes
- * the root. Returns the absolute filesystem path on success or an error
- * message string on rejection. Used by every notes-touching tool.
- */
-function resolveNotePath(root: string, path: unknown): { ok: true; full: string } | { ok: false; error: string } {
-  if (typeof path !== "string" || path.length === 0) {
-    return { ok: false, error: "Error: 'path' argument is required and must be a non-empty string." };
-  }
-  if (path.includes("..") || path.startsWith("/")) {
-    return { ok: false, error: "Error: path must be a filename within the notes folder, not a parent or absolute path." };
-  }
-  const full = resolve(root, normalize(path));
-  if (!full.startsWith(root + "/") && full !== root) {
-    return { ok: false, error: "Error: path escapes the notes folder." };
-  }
-  return { ok: true, full };
-}
-
-/**
- * Read a note from the user's notes directory.
- */
-export function makeReadNoteTool(notesRoot: string): Tool {
-  const root = resolve(notesRoot);
-  return {
-    definition: {
-      name: "read_note",
-      description: "Read a note file by filename (e.g., 'brisbane.md').",
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string", description: "Filename, e.g., 'brisbane.md'." },
-        },
-        required: ["path"],
-      },
-    },
-    execute: async (args) => {
-      const r = resolveNotePath(root, args.path);
-      if (!r.ok) return r.error;
-      try {
-        return await Bun.file(r.full).text();
-      } catch (e: any) {
-        return `Error: could not read '${args.path}': ${e?.message ?? e}`;
-      }
-    },
-  };
-}
-
-/**
- * List markdown notes in the notes directory. Returns a newline-delimited
- * list of filenames. No arguments — broad-stroke "what's there?" lookup.
- */
-export function makeListNotesTool(notesRoot: string): Tool {
-  const root = resolve(notesRoot);
-  return {
-    definition: {
-      name: "list_notes",
-      description: "List the filenames of all notes in the user's notes folder.",
-      parameters: { type: "object", properties: {} },
-    },
-    execute: async () => {
-      try {
-        const entries = await readdir(root);
-        const notes = entries.filter((e) => e.endsWith(".md")).sort();
-        if (notes.length === 0) return "(no notes)";
-        return notes.join("\n");
-      } catch (e: any) {
-        return `Error: could not list notes: ${e?.message ?? e}`;
-      }
-    },
-  };
-}
-
-/**
- * Write (or overwrite) a markdown note. Restricted to `.md` files inside
- * the notes root. Same path-safety guarantees as read_note.
- */
-export function makeWriteNoteTool(notesRoot: string): Tool {
-  const root = resolve(notesRoot);
-  return {
-    definition: {
-      name: "write_note",
-      description: "Write a new note or overwrite an existing one. Filename must end in '.md'.",
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string", description: "Filename, e.g., 'shopping.md'." },
-          content: { type: "string", description: "Markdown body to save." },
-        },
-        required: ["path", "content"],
-      },
-    },
-    execute: async (args) => {
-      const r = resolveNotePath(root, args.path);
-      if (!r.ok) return r.error;
-      if (!r.full.endsWith(".md")) {
-        return "Error: filename must end in '.md'.";
-      }
-      const content = args.content;
-      if (typeof content !== "string") {
-        return "Error: 'content' argument is required and must be a string.";
-      }
-      try {
-        await Bun.write(r.full, content);
-        return `Wrote ${args.path} (${content.length} chars).`;
-      } catch (e: any) {
-        return `Error: could not write '${args.path}': ${e?.message ?? e}`;
-      }
-    },
-  };
-}
-
-/**
- * Search notes by filename substring (case-insensitive). Returns matching
- * filenames newline-delimited. Doesn't search content — that's RAG (v5).
- */
-export function makeSearchNotesByFilenameTool(notesRoot: string): Tool {
-  const root = resolve(notesRoot);
-  return {
-    definition: {
-      name: "search_notes_by_filename",
-      description:
-        "Look up notes by filename substring (case-insensitive). Only useful when you already know part of a filename. For content-based questions ('what did I write about X', 'tell me about Y') use search_corpus instead — this tool only matches filenames, not content.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Substring to match against filenames." },
-        },
-        required: ["query"],
-      },
-    },
-    execute: async (args) => {
-      const query = args.query;
-      if (typeof query !== "string" || query.length === 0) {
-        return "Error: 'query' argument is required and must be a non-empty string.";
-      }
-      try {
-        const entries = await readdir(root);
-        const q = query.toLowerCase();
-        const matches = entries
-          .filter((e) => e.endsWith(".md") && e.toLowerCase().includes(q))
-          .sort();
-        if (matches.length === 0) return `(no notes match '${query}')`;
-        return matches.join("\n");
-      } catch (e: any) {
-        return `Error: could not search notes: ${e?.message ?? e}`;
-      }
-    },
-  };
-}
 
 /**
  * remember(key, value) — write a stable fact about the user to the profile.
@@ -392,4 +239,95 @@ function formatResults(results: ScoredChunk[]): string {
     return `[${i + 1}] sim=${sim}\n${r.displayText}`;
   });
   return blocks.join("\n\n---\n\n");
+}
+
+/**
+ * list_shortcuts — enumerate the user's macOS Shortcuts library.
+ *
+ * The model uses this to discover what's runnable; the Mac app uses
+ * the same underlying ShortcutsClient via GET /v1/shortcuts.
+ */
+export function makeListShortcutsTool(client: ShortcutsClient): Tool {
+  return {
+    definition: {
+      name: "list_shortcuts",
+      description:
+        "List the user's installed macOS Shortcuts. Call this when the user asks 'what can you run', or before run_shortcut if you don't know whether a specific shortcut exists.",
+      parameters: { type: "object", properties: {} },
+    },
+    execute: async () => {
+      const r = await client.list();
+      if (!r.ok) return `Error: could not list shortcuts: ${r.error}`;
+      if (r.shortcuts.length === 0) return "(no shortcuts installed)";
+      return r.shortcuts.map((s) => s.name).join("\n");
+    },
+  };
+}
+
+/**
+ * run_shortcut — execute a Shortcut by name, optionally piping in text.
+ *
+ * Errors are designed for the v3.5 self-correct loop: an unknown name
+ * returns "Available: …" and a "Closest matches" line so the model can
+ * retry with the corrected name on the next iteration. A first-run
+ * permission failure surfaces a clear "approve in the dialog" message
+ * the model can pass on to the user verbatim.
+ */
+export function makeRunShortcutTool(client: ShortcutsClient): Tool {
+  return {
+    definition: {
+      name: "run_shortcut",
+      description:
+        "Trigger an action on the user's Mac by running a macOS Shortcut by exact name. If the user provided content for the action (note text, timer duration, reminder body, list of items, message), pass it as `input` — leaving it empty makes the shortcut prompt the user manually, which is wrong. Chain by calling again with the next name.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "Exact shortcut name as shown in the Shortcuts app.",
+          },
+          input: {
+            type: "string",
+            description: "Text content the shortcut should consume (note body, message, timer duration). REQUIRED whenever the user gave you content for the action.",
+          },
+        },
+        required: ["name"],
+      },
+    },
+    execute: async (args) => {
+      const name = args.name;
+      if (typeof name !== "string" || name.trim().length === 0) {
+        return "Error: 'name' is required and must be a non-empty string.";
+      }
+      const input = typeof args.input === "string" ? args.input : undefined;
+
+      const r = await client.run(name, input);
+      if (r.ok) {
+        const out = r.output.trimEnd();
+        return out.length === 0 ? `Ran '${name}' (no output).` : `Ran '${name}'. Output:\n${out}`;
+      }
+
+      if (r.kind === "missing") {
+        // Keep this payload SMALL — past versions returned the full library
+        // alongside fuzzy matches and the redundancy collapsed Qwen 3-4B's
+        // attention on chains. Top 3 suggestions only; if none, fall through
+        // to a hint that list_shortcuts exists.
+        const suggestions = await client.fuzzyMatches(name, 3);
+        if (suggestions.length > 0) {
+          return `Error: shortcut '${name}' not found. Did you mean: ${suggestions.join(", ")}? Retry with the exact name.`;
+        }
+        return `Error: shortcut '${name}' not found, and no close matches. Call list_shortcuts to see what's available.`;
+      }
+
+      if (r.kind === "permission") {
+        return `Error: macOS hasn't authorized '${name}' yet. Tell the user to approve the permission dialog that just appeared (or run the shortcut manually once), then ask them to retry.`;
+      }
+
+      if (r.kind === "timeout") {
+        return `Error: ${r.error}. Tell the user the shortcut is taking too long and may need to be invoked manually.`;
+      }
+
+      return `Error running '${name}': ${r.error}`;
+    },
+  };
 }

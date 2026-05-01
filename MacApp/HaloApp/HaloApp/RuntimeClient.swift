@@ -66,6 +66,17 @@ struct SessionDetailResponse: Decodable, Sendable {
     let meta: SessionMeta?
 }
 
+struct ShortcutEntry: Decodable, Identifiable, Sendable, Equatable {
+    let name: String
+    var id: String { name }
+}
+
+struct ShortcutsResponse: Decodable, Sendable {
+    let shortcuts: [ShortcutEntry]
+    let cachedAt: Int64
+    let fromCache: Bool
+}
+
 /// Yielded events from `RuntimeClient.chat`. The Mac app folds these into
 /// its `ChatSession` to drive the dock UI.
 enum ChatEvent: Sendable {
@@ -125,6 +136,22 @@ final class RuntimeClient {
             throw RuntimeError.notReachable
         }
         return try JSONDecoder().decode(ProfileResponse.self, from: data)
+    }
+
+    /// The user's macOS Shortcuts library, surfaced via the runtime so the
+    /// app and the chat agent see the same set. Pass `force: true` to bust
+    /// the runtime's ~30s cache (e.g. user just added one in Shortcuts.app).
+    func shortcuts(force: Bool = false) async throws -> ShortcutsResponse {
+        var comps = URLComponents(url: baseURL.appendingPathComponent("v1/shortcuts"), resolvingAgainstBaseURL: false)!
+        if force {
+            comps.queryItems = [URLQueryItem(name: "force", value: "1")]
+        }
+        let session = URLSession(configuration: .ephemeral)
+        let (data, resp) = try await session.data(from: comps.url!)
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+            throw RuntimeError.notReachable
+        }
+        return try JSONDecoder().decode(ShortcutsResponse.self, from: data)
     }
 
     /// Forget a single fact. Returns true if anything was removed.

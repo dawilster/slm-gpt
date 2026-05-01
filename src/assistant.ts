@@ -10,7 +10,8 @@
  * intermediate tool reasoning.
  *
  * maxSteps prevents infinite loops if the model keeps calling tools
- * (default 5 — tighten/loosen as we learn what's reasonable).
+ * (default 8 — raised from 5 at v6.5 for shortcut chains; see design.md
+ * decision log).
  */
 
 import type { CompletionOptions, ModelClient, ToolCallReq } from "./client";
@@ -62,7 +63,7 @@ export type ChatOptions = CompletionOptions & {
   onToken?: (text: string) => void;
 };
 
-const DEFAULT_MAX_STEPS = 5;
+const DEFAULT_MAX_STEPS = 8;
 
 export class Assistant {
   constructor(

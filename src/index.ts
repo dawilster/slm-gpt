@@ -38,17 +38,16 @@ import {
   ToolRegistry,
   getCurrentTimeTool,
   makeForgetTool,
-  makeListNotesTool,
-  makeReadNoteTool,
+  makeListShortcutsTool,
   makeRememberTool,
+  makeRunShortcutTool,
   makeSearchCorpusTool,
-  makeSearchNotesByFilenameTool,
-  makeWriteNoteTool,
 } from "./tools";
 import { Profile } from "./profile";
 import { EmbeddingClient, discoverEmbeddingModel } from "./embeddings";
 import { IndexStore } from "./index_store";
 import { indexAll } from "./indexer";
+import { ShortcutsClient } from "./shortcuts";
 
 const BASE_URL = process.env.MODEL_BASE_URL ?? "http://localhost:1234/v1";
 const API_KEY = process.env.MODEL_API_KEY ?? "lm-studio";
@@ -70,9 +69,14 @@ const BASE_SYSTEM = [
   "- When the user signals a change to a known fact — including phrasings like 'I don't like X anymore', 'I now prefer Y', 'I take it Z now', 'actually, I W' — call remember(key, value) with the NEW value to overwrite the old one. Don't just acknowledge verbally; call the tool.",
   "- Only call forget(key) if the fact no longer applies AND has no replacement.",
   "Retrieval rules:",
-  "- DEFAULT TO RETRIEVAL. Before answering ANY question that could even tangentially involve the user's content, call search_corpus first. The only exceptions: pure meta-questions ('what tools do you have'), simple time queries, or instructions to perform an action you can do directly.",
+  "- DEFAULT TO RETRIEVAL for QUESTIONS about the user's content. Skip search_corpus for action requests ('create/run/start/do X') — act, don't retrieve.",
   "- This applies even to questions that *look* like general knowledge: 'what is X', 'how does Y work', 'tell me about Z' — the user may have notes on X/Y/Z. Search first, then synthesize. If nothing relevant comes back, then answer from general knowledge AND say so.",
-  "- For questions about places, preferences, names, experiences, recipes, or anything personal: always retrieve. The user is asking *you* (their personal assistant), not a general chatbot — they expect grounding in their own content.",
+  "- Never call search_corpus twice with the same query in one turn — one retrieval is the answer.",
+  "Action rules:",
+  "- All world-changing actions (creating notes, timers, reminders, launching apps) go through run_shortcut(name, input?). You have no other write surface.",
+  "- When the user provides content for the action ('create a note WITH the list', 'set a timer FOR 20 min'), pass that content as `input`. Never call run_shortcut with no input when the user gave you content — the shortcut will prompt them, defeating the point.",
+  "- If you don't know the exact shortcut name, call list_shortcuts first, then run_shortcut with the closest match.",
+  "- Chain by calling run_shortcut once per step.",
 ].join("\n");
 
 function buildSystemPrompt(profile: Profile): string {
@@ -139,14 +143,14 @@ async function main() {
     console.warn("  Load text-embedding-nomic-embed-text-v1.5 in LM Studio to enable RAG.\n");
   }
 
+  const shortcuts = new ShortcutsClient();
+
   const registry = new ToolRegistry();
   registry.register(getCurrentTimeTool);
-  registry.register(makeReadNoteTool(notesRoot));
-  registry.register(makeListNotesTool(notesRoot));
-  registry.register(makeWriteNoteTool(notesRoot));
-  registry.register(makeSearchNotesByFilenameTool(notesRoot));
   registry.register(makeRememberTool(profile));
   registry.register(makeForgetTool(profile));
+  registry.register(makeListShortcutsTool(shortcuts));
+  registry.register(makeRunShortcutTool(shortcuts));
   if (indexStore && embedder) {
     registry.register(makeSearchCorpusTool({ store: indexStore, embedder }));
   }

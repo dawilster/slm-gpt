@@ -8,6 +8,9 @@
  * Endpoints:
  *   GET  /v1/health             — { ok, model, port, embeddings, sessions }
  *   GET  /v1/sessions           — list of recent saved sessions
+ *   GET  /v1/profile            — every fact the assistant remembers
+ *   DELETE /v1/profile/<key>    — forget a single fact
+ *   GET  /v1/shortcuts          — { shortcuts: [{name}], cachedAt, fromCache }
  *   POST /v1/chat               — { message, sessionId? } → SSE stream:
  *       event: session   { sessionId }
  *       event: status    { state: "thinking" }
@@ -35,16 +38,15 @@ import {
   ToolRegistry,
   getCurrentTimeTool,
   makeForgetTool,
-  makeListNotesTool,
-  makeReadNoteTool,
+  makeListShortcutsTool,
   makeRememberTool,
+  makeRunShortcutTool,
   makeSearchCorpusTool,
-  makeSearchNotesByFilenameTool,
-  makeWriteNoteTool,
 } from "./tools";
 import { Profile } from "./profile";
 import { EmbeddingClient, discoverEmbeddingModel } from "./embeddings";
 import { IndexStore } from "./index_store";
+import { ShortcutsClient } from "./shortcuts";
 
 // ─── Config ──────────────────────────────────────────────
 
@@ -53,6 +55,51 @@ const BASE_URL      = process.env.MODEL_BASE_URL ?? "http://localhost:1234/v1";
 const API_KEY       = process.env.MODEL_API_KEY ?? "lm-studio";
 const ASSISTANT_HOME = process.env.ASSISTANT_HOME ?? join(process.env.HOME ?? "", ".assistant");
 const DEFAULT_BUDGET = Number(process.env.CONTEXT_BUDGET ?? 4096);
+const QUIET          = process.env.HALO_LOG_QUIET === "1";
+
+// ─── Logging ─────────────────────────────────────────────
+
+/** HH:MM:SS.sss — keeps log lines grep-able without taking too much width. */
+function ts(): string {
+  return new Date().toISOString().slice(11, 23);
+}
+
+/** First 8 chars of a session id, padded for column alignment. */
+function shortSid(sid: string | null | undefined): string {
+  if (!sid) return "—       ";
+  return (sid.length > 8 ? sid.slice(0, 8) : sid).padEnd(8);
+}
+
+/** Single-line preview of any text — collapses whitespace, truncates. */
+function preview(s: string, max = 80): string {
+  const oneline = s.replace(/\s+/g, " ").trim();
+  return oneline.length <= max ? oneline : oneline.slice(0, max - 1) + "…";
+}
+
+/** Compact rendering of tool args: "name='x' input=42 chars". */
+function fmtArgs(args: Record<string, unknown> | null): string {
+  if (args === null) return "<malformed args>";
+  const keys = Object.keys(args);
+  if (keys.length === 0) return "()";
+  return keys.map((k) => {
+    const v = args[k];
+    if (typeof v === "string") {
+      return v.length > 40 ? `${k}=${v.length} chars` : `${k}=${JSON.stringify(v)}`;
+    }
+    return `${k}=${JSON.stringify(v)}`;
+  }).join(", ");
+}
+
+function log(...parts: unknown[]): void {
+  if (QUIET) return;
+  console.log(`[halo ${ts()}]`, ...parts);
+}
+
+function logErr(...parts: unknown[]): void {
+  console.error(`[halo ${ts()}] ✗`, ...parts);
+}
+
+let requestCounter = 0;
 
 // Same base prompt as the REPL — kept in sync deliberately. If we move it to
 // a shared module, both index.ts and server.ts should switch together.
@@ -65,8 +112,13 @@ const BASE_SYSTEM = [
   "- When the user signals a change to a known fact — including phrasings like 'I don't like X anymore', 'I now prefer Y', 'I take it Z now', 'actually, I W' — call remember(key, value) with the NEW value to overwrite the old one. Don't just acknowledge verbally; call the tool.",
   "- Only call forget(key) if the fact no longer applies AND has no replacement.",
   "Retrieval rules:",
-  "- DEFAULT TO RETRIEVAL. Before answering ANY question that could even tangentially involve the user's content, call search_corpus first.",
-  "- For questions about places, preferences, names, experiences, recipes, or anything personal: always retrieve.",
+  "- DEFAULT TO RETRIEVAL for QUESTIONS about the user's content. Skip search_corpus for action requests ('create/run/start/do X') — act, don't retrieve.",
+  "- Never call search_corpus twice with the same query in one turn — one retrieval is the answer.",
+  "Action rules:",
+  "- All world-changing actions (creating notes, timers, reminders, launching apps) go through run_shortcut(name, input?). You have no other write surface.",
+  "- When the user provides content for the action ('create a note WITH the list', 'set a timer FOR 20 min'), pass that content as `input`. Never call run_shortcut with no input when the user gave you content — the shortcut will prompt them, defeating the point.",
+  "- If you don't know the exact shortcut name, call list_shortcuts first, then run_shortcut with the closest match.",
+  "- Chain by calling run_shortcut once per step.",
 ].join("\n");
 
 // ─── Bootstrap (once on launch) ──────────────────────────
@@ -75,14 +127,14 @@ let modelId: string;
 try {
   modelId = await discoverModel(BASE_URL, API_KEY);
 } catch {
-  console.error(`[halo-server] Could not reach model server at ${BASE_URL}.`);
-  console.error("Start LM Studio's Developer server (or set MODEL_BASE_URL).");
+  logErr(`could not reach model server at ${BASE_URL}`);
+  logErr(`start LM Studio's Developer server (or set MODEL_BASE_URL).`);
   process.exit(1);
 }
 
 const caps = await probeServerCapabilities(BASE_URL);
 if (caps && DEFAULT_BUDGET > caps.contextLimit) {
-  console.warn(`[halo-server] context budget (${DEFAULT_BUDGET}) > server ctx (${caps.contextLimit}); will silently truncate.`);
+  log(`⚠ context budget (${DEFAULT_BUDGET}) > server ctx (${caps.contextLimit}); will silently truncate`);
 }
 
 const profile = await Profile.load(join(ASSISTANT_HOME, "profile.json"));
@@ -102,14 +154,14 @@ if (embeddingModelId) {
   indexStore = new IndexStore(join(ASSISTANT_HOME, "index.sqlite"));
 }
 
+const shortcuts = new ShortcutsClient();
+
 const registry = new ToolRegistry();
 registry.register(getCurrentTimeTool);
-registry.register(makeReadNoteTool(notesRoot));
-registry.register(makeListNotesTool(notesRoot));
-registry.register(makeWriteNoteTool(notesRoot));
-registry.register(makeSearchNotesByFilenameTool(notesRoot));
 registry.register(makeRememberTool(profile));
 registry.register(makeForgetTool(profile));
+registry.register(makeListShortcutsTool(shortcuts));
+registry.register(makeRunShortcutTool(shortcuts));
 if (indexStore && embedder) {
   registry.register(makeSearchCorpusTool({ store: indexStore, embedder }));
 }
@@ -198,24 +250,35 @@ const server = Bun.serve({
   fetch: async (req) => {
     if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders });
     const url = new URL(req.url);
+    const t0 = Date.now();
+    const reqId = ++requestCounter;
+    const tag = `#${String(reqId).padStart(4, "0")}`;
+
+    // Helper to log a non-SSE response on its way out.
+    const respond = (resp: Response, note?: string): Response => {
+      const dt = Date.now() - t0;
+      const noteStr = note ? ` ${note}` : "";
+      log(`${tag} ${req.method} ${url.pathname} → ${resp.status} (${dt}ms)${noteStr}`);
+      return resp;
+    };
 
     // GET /v1/health
     if (req.method === "GET" && url.pathname === "/v1/health") {
-      return json({
+      return respond(json({
         ok: true,
         port: PORT,
         model: modelId,
         contextLimit: caps?.contextLimit ?? null,
         embeddings: embeddingModelId ?? null,
         liveSessions: liveAssistants.size,
-      });
+      }));
     }
 
     // GET /v1/sessions
     if (req.method === "GET" && url.pathname === "/v1/sessions") {
       const limit = Number(url.searchParams.get("limit") ?? 10);
       const list = await store.list(limit);
-      return json({ sessions: list });
+      return respond(json({ sessions: list }), `(${list.length} sessions, limit=${limit})`);
     }
 
     // GET /v1/sessions/<id> — full transcript (user + assistant messages
@@ -223,7 +286,7 @@ const server = Bun.serve({
     if (req.method === "GET" && url.pathname.startsWith("/v1/sessions/")) {
       const idOrPrefix = decodeURIComponent(url.pathname.slice("/v1/sessions/".length));
       const id = await store.findByPrefix(idOrPrefix);
-      if (!id) return json({ error: "session not found" }, { status: 404 });
+      if (!id) return respond(json({ error: "session not found" }, { status: 404 }), `prefix=${idOrPrefix}`);
       const turns = await store.loadTurns(id);
       const messages = turns
         .filter((t) => t.role === "user" || t.role === "assistant")
@@ -233,13 +296,13 @@ const server = Bun.serve({
           ts: t.ts,
         }));
       const meta = await store.metadataFor(id);
-      return json({ id, messages, meta });
+      return respond(json({ id, messages, meta }), `sid=${shortSid(id)} turns=${messages.length}`);
     }
 
     // GET /v1/profile — what the assistant remembers about the user.
     if (req.method === "GET" && url.pathname === "/v1/profile") {
       const facts = profile.entries().map(([key, value]) => ({ key, value }));
-      return json({ facts, path: profile.path });
+      return respond(json({ facts, path: profile.path }), `(${facts.length} facts)`);
     }
 
     // DELETE /v1/profile/<key> — forget a single fact.
@@ -247,7 +310,23 @@ const server = Bun.serve({
       const key = decodeURIComponent(url.pathname.slice("/v1/profile/".length));
       const deleted = profile.delete(key);
       if (deleted) await profile.save();
-      return json({ deleted, key });
+      return respond(json({ deleted, key }), `key='${key}' deleted=${deleted}`);
+    }
+
+    // GET /v1/shortcuts — the user's installed Shortcuts library, cached
+    // ~30s in-process. ?force=1 invalidates the cache (e.g. user just
+    // added/renamed one in the Shortcuts app).
+    if (req.method === "GET" && url.pathname === "/v1/shortcuts") {
+      const force = url.searchParams.get("force") === "1";
+      const r = await shortcuts.list({ force });
+      if (!r.ok) {
+        logErr(`${tag} shortcuts.list failed: ${r.error}`);
+        return respond(json({ error: r.error }, { status: 500 }));
+      }
+      return respond(
+        json({ shortcuts: r.shortcuts, cachedAt: r.cachedAt, fromCache: r.fromCache }),
+        `(${r.shortcuts.length} shortcuts, cache=${r.fromCache ? "hit" : "miss"}${force ? ", forced" : ""})`,
+      );
     }
 
     // POST /v1/chat — SSE stream of session/status/tool/token/done/error events.
@@ -256,20 +335,29 @@ const server = Bun.serve({
       try {
         body = (await req.json()) as { message?: string; sessionId?: string };
       } catch {
-        return json({ error: "invalid JSON body" }, { status: 400 });
+        return respond(json({ error: "invalid JSON body" }, { status: 400 }));
       }
 
       const message = (body.message ?? "").trim();
-      if (!message) return json({ error: "message is required" }, { status: 400 });
+      if (!message) return respond(json({ error: "message is required" }, { status: 400 }));
 
       // Resolve / create the session-bound Assistant.
+      const requestedSid = body.sessionId;
       let assistant: Assistant | null = null;
-      if (body.sessionId) {
-        assistant = liveAssistants.get(body.sessionId)
-          ?? await loadAssistant(body.sessionId);
+      let sessionState: "live" | "loaded" | "new" = "new";
+      if (requestedSid) {
+        const fromMemory = liveAssistants.get(requestedSid);
+        if (fromMemory) {
+          assistant = fromMemory;
+          sessionState = "live";
+        } else {
+          assistant = await loadAssistant(requestedSid);
+          if (assistant) sessionState = "loaded";
+        }
       }
       if (!assistant) {
         assistant = await createAssistant();
+        sessionState = "new";
       }
       const sid = assistant.sessionId!;
       liveAssistants.set(sid, assistant);
@@ -278,34 +366,66 @@ const server = Bun.serve({
       // system prompt so newly remembered facts show up immediately.
       assistant.state.setSystemPrompt(buildSystemPrompt());
 
+      log(`${tag} POST /v1/chat sid=${shortSid(sid)} ${sessionState.padEnd(6)} msg="${preview(message, 100)}"`);
+
       return sseStream(async (send) => {
         send({ event: "session", data: { sessionId: sid } });
         send({ event: "status",  data: { state: "thinking" } });
 
-        const result = await assistant!.chat(message, {
-          onToken:    (text) => send({ event: "token", data: { text } }),
-          onToolCall: (info) => send({ event: "tool",  data: info }),
-        });
+        try {
+          const result = await assistant!.chat(message, {
+            onToken:    (text) => send({ event: "token", data: { text } }),
+            onToolCall: (info) => {
+              send({ event: "tool", data: info });
+              const marker = info.isError ? "✗" : "·";
+              const resultPreview = preview(info.result, 80);
+              log(`${tag} sid=${shortSid(sid)}   ${marker} step ${info.step}: ${info.name}(${fmtArgs(info.args)}) → ${resultPreview} [${info.latencyMs}ms]`);
+            },
+          });
 
-        send({
-          event: "done",
-          data: {
-            promptTokens:      result.promptTokens,
-            completionTokens:  result.completionTokens,
-            latencyMs:         result.latencyMs,
-            steps:             result.steps,
-            toolCallsExecuted: result.toolCallsExecuted,
-            sessionId:         sid,
-          },
-        });
+          send({
+            event: "done",
+            data: {
+              promptTokens:      result.promptTokens,
+              completionTokens:  result.completionTokens,
+              latencyMs:         result.latencyMs,
+              steps:             result.steps,
+              toolCallsExecuted: result.toolCallsExecuted,
+              sessionId:         sid,
+            },
+          });
+
+          const dt = Date.now() - t0;
+          log(
+            `${tag} sid=${shortSid(sid)}   ← reply (${result.reply.length} chars, ` +
+            `tok in/out=${result.promptTokens}/${result.completionTokens}, ` +
+            `tools=${result.toolCallsExecuted}, steps=${result.steps}, ` +
+            `total=${dt}ms${result.trimmed ? `, trimmed ${result.totalMessages - result.sentMessages}` : ""})`,
+          );
+          if (result.reply.length > 0) {
+            log(`${tag} sid=${shortSid(sid)}     "${preview(result.reply, 120)}"`);
+          }
+        } catch (e: any) {
+          const msg = e?.message ?? String(e);
+          logErr(`${tag} sid=${shortSid(sid)} chat failed: ${msg}`);
+          throw e;
+        }
       });
     }
 
-    return json({ error: "not found" }, { status: 404 });
+    return respond(json({ error: "not found" }, { status: 404 }));
+  },
+  error: (err) => {
+    logErr(`unhandled fetch error: ${err?.message ?? err}`);
+    return new Response("internal error", { status: 500, headers: corsHeaders });
   },
 });
 
-console.log(
-  `[halo-server] http://localhost:${server.port}  ·  model: ${modelId}  ·  ` +
-  `embeddings: ${embeddingModelId ?? "off"}  ·  budget: ${DEFAULT_BUDGET}`
-);
+log(`listening on http://localhost:${server.port}`);
+log(`  model:       ${modelId}`);
+log(`  embeddings:  ${embeddingModelId ?? "(off — search_corpus disabled)"}`);
+log(`  budget:      ${DEFAULT_BUDGET}${caps?.contextLimit ? ` (server ctx ${caps.contextLimit})` : ""}`);
+log(`  tools:       ${registry.size()} (${registry.list().map((t) => t.definition.name).join(", ")})`);
+log(`  sessions:    ${ASSISTANT_HOME}/sessions`);
+log(`  notes root:  ${notesRoot}`);
+log(`  log level:   ${QUIET ? "quiet (HALO_LOG_QUIET=1)" : "verbose — set HALO_LOG_QUIET=1 to silence"}`);
