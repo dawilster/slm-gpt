@@ -38,9 +38,9 @@ final class DockWindowController: NSObject, NSWindowDelegate {
     private var settingFrameInternally = false
 
     /// Default panel height when no user-chosen size is in effect.
-    /// Wide enough to show ~5 messages without scrolling; chat scrolls
-    /// inside for anything larger.
-    private static let defaultHeight: CGFloat = 480
+    /// Compact opening size; chat scrolls inside for longer conversations,
+    /// and the user can drag any edge to expand if they want more room.
+    private static let defaultHeight: CGFloat = 340
 
     init(state: AppState) {
         self.state = state
@@ -246,6 +246,12 @@ private struct DockHost: View {
             state.dockScreen = .idle
             state.menubarState = .idle
             NSApp.keyWindow?.orderOut(nil)
+            return .handled
+        }
+        // ⌘N — start a fresh chat without dismissing the window.
+        .onKeyPress(KeyEquivalent("n"), phases: .down) { keyPress in
+            guard keyPress.modifiers.contains(.command) else { return .ignored }
+            state.chat.newConversation()
             return .handled
         }
     }
