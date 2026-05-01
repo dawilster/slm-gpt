@@ -1,0 +1,43 @@
+{
+  "label": "check-2026-04-29",
+  "timestamp": "20260429T124505",
+  "baseURL": "http://localhost:1234/v1",
+  "modelId": "qwen3-4b-instruct-2507",
+  "loadedContextLength": 4096,
+  "results": [
+    {
+      "requestedTokens": 1024,
+      "promptTokens": 1055,
+      "completionTokens": 12,
+      "ttftMs": 11852,
+      "totalMs": 12157,
+      "genTokPerSec": 39.34426229508197,
+      "needleRecalled": true,
+      "reply": "BANANA-CARNIVAL-9417",
+      "question": "\n\nEnd of filler. Question: what was the exact codeword given at the very beginning of this message? Reply with just the codeword and nothing else.",
+      "preamble": "IMPORTANT BACKGROUND FACT: The codeword for today is \"BANANA-CARNIVAL-9417\". Remember this exact codeword. What follows is unrelated filler context.\n\n",
+      "memBeforeMB": 7447,
+      "memAfterMB": 7509,
+      "memDeltaMB": 62,
+      "workerRssBeforeMB": 10.296875,
+      "workerRssAfterMB": 67.796875
+    },
+    {
+      "requestedTokens": 2048,
+      "promptTokens": 2167,
+      "completionTokens": 12,
+      "ttftMs": 15738,
+      "totalMs": 16147,
+      "genTokPerSec": 29.339853300733495,
+      "needleRecalled": true,
+      "reply": "BANANA-CARNIVAL-9417",
+      "question": "\n\nEnd of filler. Question: what was the exact codeword given at the very beginning of this message? Reply with just the codeword and nothing else.",
+      "preamble": "IMPORTANT BACKGROUND FACT: The codeword for today is \"BANANA-CARNIVAL-9417\". Remember this exact codeword. What follows is unrelated filler context.\n\n",
+      "memBeforeMB": 7505,
+      "memAfterMB": 7520,
+      "memDeltaMB": 15,
+      "workerRssBeforeMB": 66.015625,
+      "workerRssAfterMB": 52.328125
+    }
+  ]
+}
