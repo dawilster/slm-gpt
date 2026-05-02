@@ -61,27 +61,31 @@ const ASSISTANT_HOME = process.env.ASSISTANT_HOME ?? join(process.env.HOME ?? ""
 // changes like "I don't like eggs anymore" at 4B scale (v5 eval supersession
 // went 1/3). Explicit example phrases shifted that meaningfully.
 const BASE_SYSTEM = [
-  "You are a helpful personal assistant. Be concise and direct.",
-  "If you don't know or don't remember something, say so plainly.",
-  "Never invent facts about the user that weren't established in this conversation.",
-  "Memory rules:",
-  "- When the user states a stable fact about themselves (preference, name, location, relationship), call remember(key, value).",
-  "- When the user signals a change to a known fact — including phrasings like 'I don't like X anymore', 'I now prefer Y', 'I take it Z now', 'actually, I W' — call remember(key, value) with the NEW value to overwrite the old one. Don't just acknowledge verbally; call the tool.",
-  "- Only call forget(key) if the fact no longer applies AND has no replacement.",
-  "Retrieval rules:",
-  "- DEFAULT TO RETRIEVAL for QUESTIONS about the user's content. Skip search_corpus for action requests ('create/run/start/do X') — act, don't retrieve.",
-  "- This applies even to questions that *look* like general knowledge: 'what is X', 'how does Y work', 'tell me about Z' — the user may have notes on X/Y/Z. Search first, then synthesize. If nothing relevant comes back, then answer from general knowledge AND say so.",
-  "- Never call search_corpus twice with the same query in one turn — one retrieval is the answer.",
-  "Action rules:",
-  "- All world-changing actions (creating notes, timers, reminders, launching apps) go through run_shortcut(name, input?). You have no other write surface.",
-  "- When the user provides content for the action ('create a note WITH the list', 'set a timer FOR 20 min'), pass that content as `input`. Never call run_shortcut with no input when the user gave you content — the shortcut will prompt them, defeating the point.",
-  "- If you don't know the exact shortcut name, call list_shortcuts first, then run_shortcut with the closest match.",
-  "- Chain by calling run_shortcut once per step.",
+  "You are a helpful personal assistant. Be concise and direct. If you don't know or don't remember, say so. Never invent facts about the user.",
+  "Tools are real function calls — invoke them through the tool-call mechanism. Never write a tool name and arguments as plain text in your reply.",
+  "Memory: invoke `remember(key, value)` when the user states a stable fact about themselves — preferences, identity, defaults. Action requests (notes, timers, reminders, calendar, lights, etc.) go through `run_shortcut`, never `remember`. Invoke `forget` only when a fact no longer applies and has no replacement.",
+  "Retrieval: invoke `search_corpus` for questions about the user's content. Skip retrieval for action requests. Don't query the same thing twice in one turn.",
+  "Actions: world-changing actions go through `run_shortcut(name, input?)`. Each shortcut in the list below carries an `intent` tag. Pick the shortcut whose intent matches the user's request; when two share an intent, prefer the one tagged `default`. Pass user-provided content as `input`. Chain by calling `run_shortcut` once per step.",
+  "Output formats: todo list / checklist / checkboxes → format items as `- [ ] item`. Numbered steps → `1. step`. Otherwise plain prose.",
+  "Recovery: when a tool returns an Error, immediately invoke the tool again with corrected arguments. Don't narrate intent.",
 ].join("\n");
 
-function buildSystemPrompt(profile: Profile): string {
+function buildSystemPrompt(profile: Profile, shortcuts: ShortcutsClient): string {
+  const sections: string[] = [BASE_SYSTEM];
+
   const profileSection = profile.renderForSystemPrompt();
-  return profileSection ? `${BASE_SYSTEM}\n\n${profileSection}` : BASE_SYSTEM;
+  if (profileSection) sections.push(profileSection);
+
+  // Inline the real shortcut names so the model never guesses snake_case
+  // (see design.md §3.7 + the v6.5 follow-up: schema-level "name: string"
+  // gives the model no enum to match against, so it falls back on training
+  // priors. Names ambient in the prompt fixes that at the source).
+  const names = shortcuts.cachedNames();
+  if (names && names.length > 0) {
+    sections.push(`Available shortcuts (pass exact name as the \`name\` arg of run_shortcut):\n${names.map((n) => `- ${n}`).join("\n")}`);
+  }
+
+  return sections.join("\n\n");
 }
 
 const DEFAULT_BUDGET = Number(process.env.CONTEXT_BUDGET ?? 4096);
@@ -119,14 +123,19 @@ async function main() {
 
   const profile = await Profile.load(join(ASSISTANT_HOME, "profile.json"));
 
+  // Prime the shortcuts cache so the very first system-prompt build has
+  // real names to inline (cheap; ~30ms via /usr/bin/shortcuts list).
+  const shortcuts = new ShortcutsClient();
+  await shortcuts.list();
+
   const client = new OpenAICompatClient({ baseURL: BASE_URL, apiKey: API_KEY, model: modelId });
-  const context = new Context({ systemPrompt: buildSystemPrompt(profile), budget: DEFAULT_BUDGET });
+  const context = new Context({ systemPrompt: buildSystemPrompt(profile, shortcuts), budget: DEFAULT_BUDGET });
   const store = new SessionStore(join(ASSISTANT_HOME, "sessions"));
   await store.ensure();
 
   // Notes folder + tool registry. v6 adds the search_corpus tool for
-  // semantic retrieval over notes + past sessions (8 tools total). The
-  // embedding client targets the same LM Studio endpoint as the chat model.
+  // semantic retrieval over notes + past sessions. The embedding client
+  // targets the same LM Studio endpoint as the chat model.
   const notesRoot = join(ASSISTANT_HOME, "notes");
   const sessionsRoot = join(ASSISTANT_HOME, "sessions");
   await mkdir(notesRoot, { recursive: true });
@@ -142,8 +151,6 @@ async function main() {
     console.warn("⚠ no embedding model loaded at " + BASE_URL + " — search_corpus disabled.");
     console.warn("  Load text-embedding-nomic-embed-text-v1.5 in LM Studio to enable RAG.\n");
   }
-
-  const shortcuts = new ShortcutsClient();
 
   const registry = new ToolRegistry();
   registry.register(getCurrentTimeTool);
@@ -165,11 +172,11 @@ async function main() {
       context.restore(turns);
       // Profile is current truth — override whatever system prompt was
       // persisted with this session at its original creation time.
-      context.setSystemPrompt(buildSystemPrompt(profile));
+      context.setSystemPrompt(buildSystemPrompt(profile, shortcuts));
       session = store.open(recent.id);
       console.log(`resumed session ${recent.id} (${turns.length} turns from ${recent.startedAt})`);
     } else {
-      session = await freshSession(store, profile);
+      session = await freshSession(store, profile, shortcuts);
       console.log(`(no prior session to resume — started new ${session.id})`);
     }
   } else if (mode.kind === "load") {
@@ -180,11 +187,11 @@ async function main() {
     }
     const turns = await store.loadTurns(id);
     context.restore(turns);
-    context.setSystemPrompt(buildSystemPrompt(profile));
+    context.setSystemPrompt(buildSystemPrompt(profile, shortcuts));
     session = store.open(id);
     console.log(`loaded session ${id} (${turns.length} turns)`);
   } else {
-    session = await freshSession(store, profile);
+    session = await freshSession(store, profile, shortcuts);
   }
 
   const assistant = new Assistant(context, client, session, registry);
@@ -230,8 +237,8 @@ async function main() {
       context.clear();
       // Re-render in case profile changed since startup (e.g. via tool calls
       // in the previous session). Cheap; correctness is worth it.
-      context.setSystemPrompt(buildSystemPrompt(profile));
-      const fresh = await freshSession(store, profile);
+      context.setSystemPrompt(buildSystemPrompt(profile, shortcuts));
+      const fresh = await freshSession(store, profile, shortcuts);
       assistant.setSession(fresh);
       console.log(`[new session ${fresh.id}]\n`);
       continue;
@@ -308,7 +315,7 @@ async function main() {
       }
       const turns = await store.loadTurns(id);
       context.restore(turns);
-      context.setSystemPrompt(buildSystemPrompt(profile));
+      context.setSystemPrompt(buildSystemPrompt(profile, shortcuts));
       assistant.setSession(store.open(id));
       console.log(`  loaded ${id} (${turns.length} turns)\n`);
       continue;
@@ -374,7 +381,7 @@ async function main() {
         console.log(`  no fact under '${Profile.normalizeKey(key)}'\n`);
       } else {
         await profile.save();
-        context.setSystemPrompt(buildSystemPrompt(profile));
+        context.setSystemPrompt(buildSystemPrompt(profile, shortcuts));
         console.log(`  forgot '${Profile.normalizeKey(key)}'\n`);
       }
       continue;
@@ -405,7 +412,7 @@ async function main() {
       }
       const turns = await store.loadTurns(candidate.id);
       context.restore(turns);
-      context.setSystemPrompt(buildSystemPrompt(profile));
+      context.setSystemPrompt(buildSystemPrompt(profile, shortcuts));
       assistant.setSession(store.open(candidate.id));
       console.log(`  resumed ${candidate.id} (${turns.length} turns)\n`);
       continue;
@@ -415,7 +422,7 @@ async function main() {
     // remember/forget on the previous turn become "always known" now. The
     // model only sees the system prompt at the start of each request, so
     // updating in-place between requests is the cheapest correct option.
-    context.setSystemPrompt(buildSystemPrompt(profile));
+    context.setSystemPrompt(buildSystemPrompt(profile, shortcuts));
 
     try {
       const r = await assistant.chat(input, { onToolCall: printToolCall });
@@ -434,11 +441,16 @@ async function main() {
   rl.close();
 }
 
-async function freshSession(store: SessionStore, profile: Profile): Promise<Session> {
+async function freshSession(
+  store: SessionStore,
+  profile: Profile,
+  shortcuts: ShortcutsClient,
+): Promise<Session> {
   const s = store.newSession();
-  // Persist the system prompt as it stands now (with current profile facts)
-  // so a future restore reproduces the original conversation faithfully.
-  await s.append({ role: "system", content: buildSystemPrompt(profile) });
+  // Persist the system prompt as it stands now (with current profile facts +
+  // shortcut names) so a future restore reproduces the original conversation
+  // faithfully.
+  await s.append({ role: "system", content: buildSystemPrompt(profile, shortcuts) });
   return s;
 }
 

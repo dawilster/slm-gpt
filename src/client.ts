@@ -53,6 +53,20 @@ export type CompletionResult = {
   toolCalls?: ToolCallReq[];
   usage: Usage;
   latencyMs: number;
+  /**
+   * Streaming only: ms from request issued to first response chunk. Dominated
+   * by prompt-eval (prefill) on local SLMs. Knowing this separately from the
+   * total tells you whether long requests are paying for prefill or for
+   * generation — the two need different optimisations.
+   */
+  firstTokenMs?: number;
+  /**
+   * Reasoning trace from thinking-mode models. LM Studio's MLX runtime
+   * exposes this as a separate `reasoning_content` field on the chat
+   * message (and `delta.reasoning_content` during streaming). Empty string
+   * when the model didn't emit any thinking.
+   */
+  thinking?: string;
 };
 
 export type CompletionOptions = {
@@ -60,6 +74,15 @@ export type CompletionOptions = {
   maxTokens?: number;
   /** Tools available to the model for this request. */
   tools?: ToolDefinition[];
+  /**
+   * Qwen 3.5 family: enable the model's "thinking" mode by passing
+   * `enable_thinking: true` in the request's extra_body. The model emits a
+   * `<think>...</think>` block before the actual reply. We strip it from the
+   * persisted reply so downstream consumers (eval, persistence, synthetic-
+   * call recovery) only see the answer; raw stream tokens still flow
+   * through `onToken` so the UI can render thinking if desired.
+   */
+  enableThinking?: boolean;
 };
 
 /**
@@ -71,6 +94,13 @@ export type CompletionOptions = {
  */
 export type StreamingOptions = CompletionOptions & {
   onToken?: (text: string) => void;
+  /**
+   * Token observer for thinking-mode reasoning content (LM Studio's
+   * `delta.reasoning_content`). Fires before `onToken` for the same turn —
+   * the model thinks, then answers. UIs can use this to render the
+   * thinking trace in a separate (e.g. collapsible) surface.
+   */
+  onThinking?: (text: string) => void;
 };
 
 export interface ModelClient {
@@ -121,17 +151,28 @@ export class OpenAICompatClient implements ModelClient {
 
   async complete(messages: Msg[], options: CompletionOptions = {}): Promise<CompletionResult> {
     const t0 = Date.now();
-    const resp = await this.client.chat.completions.create({
+    // `enable_thinking` is a Qwen-3.5 extra_body field. The OpenAI Node SDK
+    // forwards unknown fields, so we splat it in via an any-typed param object.
+    const params: any = {
       model: this.model,
       messages: messages.map(toApiMessage),
       temperature: options.temperature ?? 0.7,
       max_tokens: options.maxTokens,
       tools: options.tools?.map((t) => ({ type: "function" as const, function: t })),
-    });
+    };
+    if (options.enableThinking) params.enable_thinking = true;
+    const resp = await this.client.chat.completions.create(params);
     const latencyMs = Date.now() - t0;
     const choice = resp.choices[0];
     const message = choice?.message;
-    const reply = message?.content ?? "";
+    const rawReply = message?.content ?? "";
+    // LM Studio's MLX runtime puts thinking-mode reasoning into a separate
+    // `reasoning_content` field on the message — extract it. Older models
+    // that emit `<think>...</think>` inline get caught by stripThinking()
+    // as a fallback.
+    const reasoningField = (message as any)?.reasoning_content;
+    const thinking = typeof reasoningField === "string" ? reasoningField : "";
+    const reply = options.enableThinking ? stripThinking(rawReply) : rawReply;
     const rawToolCalls = message?.tool_calls;
     const toolCalls: ToolCallReq[] | undefined = rawToolCalls
       ?.filter((tc): tc is typeof tc & { function: { name: string; arguments: string } } =>
@@ -147,6 +188,7 @@ export class OpenAICompatClient implements ModelClient {
       reply,
       toolCalls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined,
       latencyMs,
+      thinking: thinking || undefined,
       usage: {
         promptTokens: usage?.prompt_tokens ?? 0,
         completionTokens: usage?.completion_tokens ?? 0,
@@ -162,26 +204,51 @@ export class OpenAICompatClient implements ModelClient {
    */
   async completeStreaming(messages: Msg[], options: StreamingOptions = {}): Promise<CompletionResult> {
     const t0 = Date.now();
-    const stream = await this.client.chat.completions.create({
+    const baseParams = {
       model: this.model,
       messages: messages.map(toApiMessage),
       temperature: options.temperature ?? 0.7,
       max_tokens: options.maxTokens,
       tools: options.tools?.map((t) => ({ type: "function" as const, function: t })),
-      stream: true,
+      stream: true as const,
       stream_options: { include_usage: true },
-    });
+    };
+    const params = options.enableThinking
+      ? { ...baseParams, enable_thinking: true } as typeof baseParams
+      : baseParams;
+    const stream = await this.client.chat.completions.create(params);
 
     let reply = "";
+    let thinking = "";
     // Tool calls stream as deltas indexed by `index`; we collate them as we go.
     const toolBuf = new Map<number, { id?: string; name?: string; args: string }>();
     let promptTokens = 0;
     let completionTokens = 0;
+    let firstTokenMs: number | undefined;
 
     for await (const chunk of stream) {
       const choice = chunk.choices?.[0];
-      const delta = choice?.delta;
+      const delta: any = choice?.delta;
 
+      // Stamp the moment the model produces its first observable output —
+      // text token OR reasoning token OR tool-call delta. Everything before
+      // this is prefill. (Thinking models open with reasoning, so excluding
+      // it would over-attribute prefill time.)
+      const sawFirst = (delta?.content && delta.content.length > 0)
+        || (delta?.reasoning_content && delta.reasoning_content.length > 0)
+        || (delta?.tool_calls && delta.tool_calls.length > 0);
+      if (sawFirst && firstTokenMs === undefined) {
+        firstTokenMs = Date.now() - t0;
+      }
+
+      // LM Studio streams `delta.reasoning_content` for thinking-mode
+      // reasoning, separate from `delta.content` (the answer). Route them
+      // to different observers so the UI can render the trace in a
+      // collapsible block.
+      if (delta?.reasoning_content) {
+        thinking += delta.reasoning_content;
+        options.onThinking?.(delta.reasoning_content);
+      }
       if (delta?.content) {
         reply += delta.content;
         options.onToken?.(delta.content);
@@ -217,13 +284,34 @@ export class OpenAICompatClient implements ModelClient {
       });
     }
 
+    const cleanReply = options.enableThinking ? stripThinking(reply) : reply;
+
     return {
-      reply,
+      reply: cleanReply,
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
       latencyMs,
+      firstTokenMs,
+      thinking: thinking || undefined,
       usage: { promptTokens, completionTokens },
     };
   }
+}
+
+/**
+ * Strip Qwen-3.5 `<think>...</think>` blocks from a reply. The model emits
+ * its meta-reasoning inside these tags before the actual answer; we keep
+ * them out of the persisted reply so:
+ *   - the eval / synthetic-call recovery doesn't get fooled by pseudo-code
+ *     in the thinking
+ *   - downstream prompts (next agent loop iteration) don't accumulate noise
+ *   - the chat UI sees a clean answer
+ *
+ * Streaming `onToken` still emits raw thinking tokens so callers can
+ * render them separately if they want; this only affects the resolved
+ * `reply` field.
+ */
+function stripThinking(text: string): string {
+  return text.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim();
 }
 
 /** Discover the first non-embedding model loaded at the endpoint. */

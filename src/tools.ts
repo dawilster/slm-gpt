@@ -203,14 +203,11 @@ export function makeSearchCorpusTool(opts: {
     definition: {
       name: "search_corpus",
       description:
-        "Search the user's personal notes and past chat sessions for relevant passages. Call this whenever the user asks about something they have written, recorded, said, or discussed before — including general questions about topics they have notes on (e.g. 'what is petrichor' if they have a petrichor note, 'what coffee am I drinking', 'tell me about my dive in Cairns'). Prefer this over read_note when you don't already know the exact filename. Returns up to 3 passages ranked by semantic similarity, each tagged with its source.",
+        "Semantic search across the user's notes and past sessions. Call for questions about things they've written, said, or discussed (incl. 'what is X' / 'tell me about Y' if they may have notes on it). Returns up to 3 passages with source tags.",
       parameters: {
         type: "object",
         properties: {
-          query: {
-            type: "string",
-            description: "Natural-language description of what to find (a question, topic, or phrase).",
-          },
+          query: { type: "string", description: "What to find — a question, topic, or phrase." },
         },
         required: ["query"],
       },
@@ -252,7 +249,7 @@ export function makeListShortcutsTool(client: ShortcutsClient): Tool {
     definition: {
       name: "list_shortcuts",
       description:
-        "List the user's installed macOS Shortcuts. Call this when the user asks 'what can you run', or before run_shortcut if you don't know whether a specific shortcut exists.",
+        "List the user's installed macOS Shortcuts. Call before run_shortcut if unsure of the exact name.",
       parameters: { type: "object", properties: {} },
     },
     execute: async () => {
@@ -278,18 +275,12 @@ export function makeRunShortcutTool(client: ShortcutsClient): Tool {
     definition: {
       name: "run_shortcut",
       description:
-        "Trigger an action on the user's Mac by running a macOS Shortcut by exact name. If the user provided content for the action (note text, timer duration, reminder body, list of items, message), pass it as `input` — leaving it empty makes the shortcut prompt the user manually, which is wrong. Chain by calling again with the next name.",
+        "Run a macOS Shortcut by exact name. Pass user-provided content as `input` (note body, timer duration, message) — without it the shortcut will prompt the user.",
       parameters: {
         type: "object",
         properties: {
-          name: {
-            type: "string",
-            description: "Exact shortcut name as shown in the Shortcuts app.",
-          },
-          input: {
-            type: "string",
-            description: "Text content the shortcut should consume (note body, message, timer duration). REQUIRED whenever the user gave you content for the action.",
-          },
+          name:  { type: "string", description: "Exact shortcut name." },
+          input: { type: "string", description: "Text content for the shortcut. Required when the user gave you content." },
         },
         required: ["name"],
       },

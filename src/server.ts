@@ -14,10 +14,11 @@
  *   POST /v1/chat               — { message, sessionId? } → SSE stream:
  *       event: session   { sessionId }
  *       event: status    { state: "thinking" }
+ *       event: thinking  { text }              ← reasoning content delta (Qwen-3.5 thinking mode)
  *       event: tool      { step, name, args, result, latencyMs, isError }
- *       event: token     { text }              ← full reply (single chunk for now)
+ *       event: token     { text }              ← reply text delta
  *       event: done      { promptTokens, completionTokens, latencyMs, steps,
- *                          toolCallsExecuted }
+ *                          toolCallsExecuted, thinkingChars }
  *       event: error     { message }
  *
  * Token-by-token streaming will land later — the `token` event is shaped so
@@ -31,6 +32,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import { OpenAICompatClient, discoverModel, probeServerCapabilities } from "./client";
+import type { ToolCallReq } from "./client";
 import { Context } from "./context";
 import { Assistant } from "./assistant";
 import { SessionStore, type Session } from "./sessions";
@@ -47,6 +49,8 @@ import { Profile } from "./profile";
 import { EmbeddingClient, discoverEmbeddingModel } from "./embeddings";
 import { IndexStore } from "./index_store";
 import { ShortcutsClient } from "./shortcuts";
+import { ShortcutMetaStore, makeClassifier } from "./shortcut_meta";
+import { EventLog } from "./events";
 
 // ─── Config ──────────────────────────────────────────────
 
@@ -56,6 +60,7 @@ const API_KEY       = process.env.MODEL_API_KEY ?? "lm-studio";
 const ASSISTANT_HOME = process.env.ASSISTANT_HOME ?? join(process.env.HOME ?? "", ".assistant");
 const DEFAULT_BUDGET = Number(process.env.CONTEXT_BUDGET ?? 4096);
 const QUIET          = process.env.HALO_LOG_QUIET === "1";
+const THINKING       = process.env.HALO_THINKING === "1";
 
 // ─── Logging ─────────────────────────────────────────────
 
@@ -104,21 +109,13 @@ let requestCounter = 0;
 // Same base prompt as the REPL — kept in sync deliberately. If we move it to
 // a shared module, both index.ts and server.ts should switch together.
 const BASE_SYSTEM = [
-  "You are a helpful personal assistant. Be concise and direct.",
-  "If you don't know or don't remember something, say so plainly.",
-  "Never invent facts about the user that weren't established in this conversation.",
-  "Memory rules:",
-  "- When the user states a stable fact about themselves (preference, name, location, relationship), call remember(key, value).",
-  "- When the user signals a change to a known fact — including phrasings like 'I don't like X anymore', 'I now prefer Y', 'I take it Z now', 'actually, I W' — call remember(key, value) with the NEW value to overwrite the old one. Don't just acknowledge verbally; call the tool.",
-  "- Only call forget(key) if the fact no longer applies AND has no replacement.",
-  "Retrieval rules:",
-  "- DEFAULT TO RETRIEVAL for QUESTIONS about the user's content. Skip search_corpus for action requests ('create/run/start/do X') — act, don't retrieve.",
-  "- Never call search_corpus twice with the same query in one turn — one retrieval is the answer.",
-  "Action rules:",
-  "- All world-changing actions (creating notes, timers, reminders, launching apps) go through run_shortcut(name, input?). You have no other write surface.",
-  "- When the user provides content for the action ('create a note WITH the list', 'set a timer FOR 20 min'), pass that content as `input`. Never call run_shortcut with no input when the user gave you content — the shortcut will prompt them, defeating the point.",
-  "- If you don't know the exact shortcut name, call list_shortcuts first, then run_shortcut with the closest match.",
-  "- Chain by calling run_shortcut once per step.",
+  "You are a helpful personal assistant. Be concise and direct. If you don't know or don't remember, say so. Never invent facts about the user.",
+  "Tools are real function calls — invoke them through the tool-call mechanism. Never write a tool name and arguments as plain text in your reply.",
+  "Memory: invoke `remember(key, value)` when the user states a stable fact about themselves — preferences, identity, defaults. Action requests (notes, timers, reminders, calendar, lights, etc.) go through `run_shortcut`, never `remember`. Invoke `forget` only when a fact no longer applies and has no replacement.",
+  "Retrieval: invoke `search_corpus` for questions about the user's content. Skip retrieval for action requests. Don't query the same thing twice in one turn.",
+  "Actions: world-changing actions go through `run_shortcut(name, input?)`. Each shortcut in the list below carries an `intent` tag. Pick the shortcut whose intent matches the user's request; when two share an intent, prefer the one tagged `default`. Pass user-provided content as `input`. Chain by calling `run_shortcut` once per step.",
+  "Output formats: todo list / checklist / checkboxes → format items as `- [ ] item`. Numbered steps → `1. step`. Otherwise plain prose.",
+  "Recovery: when a tool returns an Error, immediately invoke the tool again with corrected arguments. Don't narrate intent.",
 ].join("\n");
 
 // ─── Bootstrap (once on launch) ──────────────────────────
@@ -143,6 +140,12 @@ const sessionsRoot = join(ASSISTANT_HOME, "sessions");
 await mkdir(notesRoot, { recursive: true });
 await mkdir(sessionsRoot, { recursive: true });
 
+// Append-only telemetry log. Captures things that don't already live in
+// sessions/profile/notes (per-request timings, errors, tool-call detail,
+// classifier outcomes). Surfaces nothing yet — this is observability for
+// later analysis. See src/events.ts for the rationale.
+const events = new EventLog(join(ASSISTANT_HOME, "events.sqlite"));
+
 const store = new SessionStore(sessionsRoot);
 await store.ensure();
 
@@ -156,6 +159,39 @@ if (embeddingModelId) {
 
 const shortcuts = new ShortcutsClient();
 
+// Wire the metadata layer: each shortcut name carries an intent + default
+// flag, so the model picks by intent matching rather than name guessing
+// (see design.md §5.1 / §7 / §8 for the full rationale). The classifier is
+// the same local model the brain uses — runs only on first sight of a name,
+// almost never fires once a user's library is steady.
+const metaPath = join(ASSISTANT_HOME, "shortcut-meta.json");
+const metaStore = await ShortcutMetaStore.load(metaPath);
+const metaClassifierClient = new OpenAICompatClient({ baseURL: BASE_URL, apiKey: API_KEY, model: modelId });
+shortcuts.setMetaBinding({
+  store: metaStore,
+  classify: makeClassifier(metaClassifierClient),
+  onSync: ({ added, removed, total }) => {
+    if (added > 0 || removed > 0) {
+      log(`shortcut-meta sync: +${added} -${removed}  (library has ${total})`);
+      events.record("meta_change", { added, removed, libraryTotal: total });
+    }
+  },
+});
+
+// Prime the shortcuts cache so the very first system prompt build has the
+// real names to inline. First call also classifies any new names against
+// the meta store; subsequent calls within the 30s TTL just read the cache.
+{
+  const r = await shortcuts.list();
+  if (!r.ok) {
+    log(`⚠ couldn't prime shortcut list: ${r.error}`);
+  } else {
+    const tagged = r.shortcuts.filter((s) => s.intent && s.intent !== "other").length;
+    const defaults = r.shortcuts.filter((s) => s.isDefault).length;
+    log(`  shortcuts:   ${r.shortcuts.length} cached  ·  ${tagged} tagged with intent  ·  ${defaults} marked default`);
+  }
+}
+
 const registry = new ToolRegistry();
 registry.register(getCurrentTimeTool);
 registry.register(makeRememberTool(profile));
@@ -167,8 +203,117 @@ if (indexStore && embedder) {
 }
 
 function buildSystemPrompt(): string {
+  const sections: string[] = [BASE_SYSTEM];
+
+  // Profile facts — stable across turns when unchanged, so they sit cleanly
+  // inside the prompt cache.
   const profileSection = profile.renderForSystemPrompt();
-  return profileSection ? `${BASE_SYSTEM}\n\n${profileSection}` : BASE_SYSTEM;
+  if (profileSection) sections.push(profileSection);
+
+  // Available shortcuts, rendered with intent + default flag from the meta
+  // store. The model picks by intent matching, preferring entries marked
+  // [default] when more than one shortcut shares an intent. This replaces
+  // the library-specific examples we had earlier in BASE_SYSTEM.
+  const entries = shortcuts.cachedEntries();
+  if (entries && entries.length > 0) {
+    const lines = entries.map((e) => {
+      const intentTag = e.intent ? `intent: ${e.intent}` : "intent: other";
+      const defaultTag = e.isDefault ? ", default" : "";
+      return `- ${e.name}  [${intentTag}${defaultTag}]`;
+    });
+    sections.push(
+      `Available shortcuts (pass exact name as the \`name\` arg of run_shortcut). Pick by intent matching the user's request; when two shortcuts share an intent, prefer the one tagged "default":\n${lines.join("\n")}`,
+    );
+  }
+
+  return sections.join("\n\n");
+}
+
+/**
+ * Last-resort tool resolver for the §5.1 "shortcut-name as tool-name" 4B
+ * failure mode: the model emits a structured tool_call whose name IS a
+ * shortcut name (e.g. `Create Note`), instead of using `run_shortcut` with
+ * that name as an argument. This catches it at runtime: fuzzy-match the
+ * unknown name against the shortcuts cache, then transparently route the
+ * call through the real `run_shortcut` tool.
+ *
+ * Returns a result string that begins with `(routed from <X>)` so the model
+ * sees what happened in the next turn's context — useful self-correction
+ * signal without polluting BASE_SYSTEM.
+ */
+async function shortcutFallback(tc: ToolCallReq): Promise<string | null> {
+  const requested = tc.function.name;
+  if (typeof requested !== "string" || requested.length === 0) return null;
+
+  const entries = shortcuts.cachedEntries();
+  if (!entries || entries.length === 0) return null;
+
+  // Exact match first (case-sensitive — that's what the user's library uses);
+  // then case-insensitive; then fuzzy as a last-resort suggestion.
+  let matched = entries.find((e) => e.name === requested)?.name;
+  if (!matched) {
+    const lower = requested.toLowerCase();
+    matched = entries.find((e) => e.name.toLowerCase() === lower)?.name;
+  }
+  if (!matched) {
+    const ranked = await shortcuts.fuzzyMatches(requested, 1);
+    matched = ranked[0];
+  }
+  if (!matched) return null;
+
+  // Pull the run_shortcut tool from the registry to delegate. If it's not
+  // registered (shouldn't happen in normal config) we have nothing to do.
+  const runShortcut = registry.get("run_shortcut");
+  if (!runShortcut) return null;
+
+  // Map whatever args the model passed into the run_shortcut shape:
+  //   - if the model already passed `name` / `input`, honour them
+  //   - else look for common content keys (text, body, content, message, value)
+  //   - else treat the longest string value as `input`
+  let parsedArgs: Record<string, unknown> = {};
+  try {
+    if (tc.function.arguments) parsedArgs = JSON.parse(tc.function.arguments);
+  } catch { /* ignore — empty args */ }
+
+  let input: string | undefined;
+  if (typeof parsedArgs.input === "string") input = parsedArgs.input;
+  else {
+    for (const key of ["text", "body", "content", "message", "value", "note"]) {
+      const v = parsedArgs[key];
+      if (typeof v === "string" && v.length > 0) { input = v; break; }
+    }
+  }
+  if (input === undefined) {
+    const stringVals = Object.values(parsedArgs)
+      .filter((v): v is string => typeof v === "string" && v.length > 0)
+      .sort((a, b) => b.length - a.length);
+    if (stringVals.length > 0) input = stringVals[0];
+  }
+
+  const synthesized: Record<string, unknown> = { name: matched };
+  if (input !== undefined) synthesized.input = input;
+
+  log(`unknown-tool fallback: '${requested}' → run_shortcut(name='${matched}'${input ? `, input=${input.length} chars` : ""})`);
+  events.record("fallback_route", {
+    requestedName: requested,
+    routedTo: matched,
+    inputChars: input?.length ?? 0,
+  });
+
+  try {
+    const result = await runShortcut.execute(synthesized);
+    // Prefix so the conversation context shows what was rerouted; the model
+    // can use this as a hint for next turn's tool selection.
+    return `(routed from '${requested}' → run_shortcut) ${result}`;
+  } catch (e: any) {
+    events.record("error", {
+      scope: "fallback_route",
+      requestedName: requested,
+      routedTo: matched,
+      message: e?.message ?? String(e),
+    });
+    return `Error in fallback for '${requested}': ${e?.message ?? e}`;
+  }
 }
 
 // In-memory map of live assistants by session id. Persists across requests
@@ -259,6 +404,12 @@ const server = Bun.serve({
       const dt = Date.now() - t0;
       const noteStr = note ? ` ${note}` : "";
       log(`${tag} ${req.method} ${url.pathname} → ${resp.status} (${dt}ms)${noteStr}`);
+      events.record("request", {
+        method: req.method,
+        path: url.pathname,
+        status: resp.status,
+        latencyMs: dt,
+      }, { requestId: reqId });
       return resp;
     };
 
@@ -362,8 +513,10 @@ const server = Bun.serve({
       const sid = assistant.sessionId!;
       liveAssistants.set(sid, assistant);
 
-      // Profile may have changed since this session started — refresh the
-      // system prompt so newly remembered facts show up immediately.
+      // Refresh the profile + shortcut surfaces so newly remembered facts
+      // and newly added Shortcuts show up on this turn. shortcuts.list()
+      // hits its own 30s cache, so this is a no-op most of the time.
+      await shortcuts.list();
       assistant.state.setSystemPrompt(buildSystemPrompt());
 
       log(`${tag} POST /v1/chat sid=${shortSid(sid)} ${sessionState.padEnd(6)} msg="${preview(message, 100)}"`);
@@ -374,13 +527,25 @@ const server = Bun.serve({
 
         try {
           const result = await assistant!.chat(message, {
+            enableThinking: THINKING,
             onToken:    (text) => send({ event: "token", data: { text } }),
+            onThinking: (text) => send({ event: "thinking", data: { text } }),
             onToolCall: (info) => {
               send({ event: "tool", data: info });
               const marker = info.isError ? "✗" : "·";
               const resultPreview = preview(info.result, 80);
               log(`${tag} sid=${shortSid(sid)}   ${marker} step ${info.step}: ${info.name}(${fmtArgs(info.args)}) → ${resultPreview} [${info.latencyMs}ms]`);
+              const evtType = info.name === "run_shortcut" ? "shortcut_run" : "tool_call";
+              events.record(evtType, {
+                step: info.step,
+                name: info.name,
+                args: info.args,
+                resultPreview: preview(info.result, 200),
+                latencyMs: info.latencyMs,
+                isError: info.isError,
+              }, { sessionId: sid, requestId: reqId });
             },
+            unknownToolFallback: shortcutFallback,
           });
 
           send({
@@ -391,23 +556,56 @@ const server = Bun.serve({
               latencyMs:         result.latencyMs,
               steps:             result.steps,
               toolCallsExecuted: result.toolCallsExecuted,
+              thinkingChars:     result.thinking.length,
               sessionId:         sid,
             },
           });
 
           const dt = Date.now() - t0;
+          // tok/s is over generation time only — prefill is dominated by
+          // prompt-eval and would dilute the number you actually care about
+          // when comparing models.
+          const tps = result.generationMs > 0
+            ? (result.completionTokens * 1000 / result.generationMs).toFixed(1)
+            : "—";
+          const thinkNote = result.thinking.length > 0 ? `, thinking=${result.thinking.length}c` : "";
           log(
             `${tag} sid=${shortSid(sid)}   ← reply (${result.reply.length} chars, ` +
             `tok in/out=${result.promptTokens}/${result.completionTokens}, ` +
+            `prefill=${result.prefillMs}ms, gen=${result.generationMs}ms @ ${tps} tok/s, ` +
             `tools=${result.toolCallsExecuted}, steps=${result.steps}, ` +
-            `total=${dt}ms${result.trimmed ? `, trimmed ${result.totalMessages - result.sentMessages}` : ""})`,
+            `total=${dt}ms${thinkNote}${result.trimmed ? `, trimmed ${result.totalMessages - result.sentMessages}` : ""})`,
           );
           if (result.reply.length > 0) {
             log(`${tag} sid=${shortSid(sid)}     "${preview(result.reply, 120)}"`);
           }
+          events.record("chat_turn", {
+            userMessagePreview: preview(message, 200),
+            replyChars: result.reply.length,
+            replyPreview: preview(result.reply, 200),
+            promptTokens: result.promptTokens,
+            completionTokens: result.completionTokens,
+            prefillMs: result.prefillMs,
+            generationMs: result.generationMs,
+            tokensPerSec: result.generationMs > 0
+              ? Number((result.completionTokens * 1000 / result.generationMs).toFixed(1))
+              : null,
+            steps: result.steps,
+            toolCallsExecuted: result.toolCallsExecuted,
+            totalLatencyMs: dt,
+            sessionState,
+            trimmedMessages: result.trimmed ? result.totalMessages - result.sentMessages : 0,
+            thinkingChars: result.thinking.length,
+            thinkingPreview: result.thinking.length > 0 ? preview(result.thinking, 300) : null,
+          }, { sessionId: sid, requestId: reqId });
         } catch (e: any) {
           const msg = e?.message ?? String(e);
           logErr(`${tag} sid=${shortSid(sid)} chat failed: ${msg}`);
+          events.record("error", {
+            scope: "chat",
+            message: msg,
+            stack: e?.stack ?? null,
+          }, { sessionId: sid, requestId: reqId });
           throw e;
         }
       });
@@ -417,6 +615,11 @@ const server = Bun.serve({
   },
   error: (err) => {
     logErr(`unhandled fetch error: ${err?.message ?? err}`);
+    events.record("error", {
+      scope: "fetch",
+      message: err?.message ?? String(err),
+      stack: (err as any)?.stack ?? null,
+    });
     return new Response("internal error", { status: 500, headers: corsHeaders });
   },
 });
@@ -428,4 +631,17 @@ log(`  budget:      ${DEFAULT_BUDGET}${caps?.contextLimit ? ` (server ctx ${caps
 log(`  tools:       ${registry.size()} (${registry.list().map((t) => t.definition.name).join(", ")})`);
 log(`  sessions:    ${ASSISTANT_HOME}/sessions`);
 log(`  notes root:  ${notesRoot}`);
+log(`  events:      ${events.count()} accumulated`);
 log(`  log level:   ${QUIET ? "quiet (HALO_LOG_QUIET=1)" : "verbose — set HALO_LOG_QUIET=1 to silence"}`);
+log(`  thinking:    ${THINKING ? "ON  (HALO_THINKING=1 — Qwen-3.5 only)" : "off — set HALO_THINKING=1 to enable for Qwen 3.5"}`);
+
+events.record("boot", {
+  port: server.port,
+  model: modelId,
+  embeddings: embeddingModelId,
+  contextBudget: DEFAULT_BUDGET,
+  serverContextLimit: caps?.contextLimit ?? null,
+  toolCount: registry.size(),
+  toolNames: registry.list().map((t) => t.definition.name),
+  shortcutCount: shortcuts.cachedNames()?.length ?? 0,
+});

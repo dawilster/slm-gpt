@@ -17,6 +17,10 @@ final class ChatMessage: Identifiable {
     /// Tool-call rows the assistant emitted while producing this message
     /// (one per executed tool — populated as `tool` events arrive over SSE).
     var toolCalls: [ToolCallTrace]
+    /// Thinking-mode reasoning trace (Qwen 3.5 with HALO_THINKING=1).
+    /// Streams in via `event: thinking` deltas before the answer arrives.
+    /// Empty string means the model isn't a thinking model or thinking is off.
+    var thinking: String
     /// True while the assistant is still streaming this turn.
     var isStreaming: Bool
     /// Final-turn metadata; nil while streaming.
@@ -30,6 +34,7 @@ final class ChatMessage: Identifiable {
         self.role = role
         self.text = text
         self.toolCalls = []
+        self.thinking = ""
         self.isStreaming = isStreaming
     }
 }
@@ -78,9 +83,10 @@ final class ChatSession {
     /// Most recent done-event metadata, for the status strip.
     var lastTurnMeta: TurnMeta?
 
-    /// Tracks when the user last either sent something or summoned the dock,
-    /// so we can decide whether a re-summon should start fresh or continue.
-    private var lastInteractionAt: Date = .distantPast
+    /// Stamped when the dock dismisses. Threading resets only when the
+    /// dock has been *closed* for longer than `idleResetWindow` — having
+    /// the dock open and reading slowly never trips it.
+    private var lastDismissedAt: Date?
 
     func newConversation() {
         cancel()
@@ -88,20 +94,34 @@ final class ChatSession {
         messages.removeAll()
         status = .ready
         lastTurnMeta = nil
-        lastInteractionAt = Date()
+        lastDismissedAt = nil
     }
 
-    /// Called when the dock is summoned. If the conversation has been idle
-    /// for `idleResetWindow`, start a clean chat — keeps long-forgotten
-    /// conversations from polluting context when the user comes back later.
+    /// Called when the dock is dismissed (click-outside, Esc, or hotkey
+    /// toggle). Stamps the time so the next summon can decide whether
+    /// enough time has passed to start a fresh chat.
+    func markDismissed() {
+        lastDismissedAt = Date()
+    }
+
+    /// Called when the dock is summoned. Reset only if the dock has been
+    /// dismissed for more than `idleResetWindow` — coming back quickly
+    /// preserves the conversation; coming back hours later starts fresh.
     func markSummoned() {
-        let now = Date()
-        if !messages.isEmpty,
-           now.timeIntervalSince(lastInteractionAt) > Self.idleResetWindow {
-            chatLog.debug("idle reset (>\(Self.idleResetWindow, privacy: .public)s) — starting new chat")
-            newConversation()
+        guard !messages.isEmpty, let since = lastDismissedAt else {
+            // No dismissal recorded → either first launch or already
+            // visible. Either way, leave the conversation alone.
+            lastDismissedAt = nil
+            return
         }
-        lastInteractionAt = now
+        let dismissedFor = Date().timeIntervalSince(since)
+        if dismissedFor > Self.idleResetWindow {
+            chatLog.debug("idle reset: dismissed for \(dismissedFor)s, starting new chat")
+            newConversation()
+        } else {
+            chatLog.debug("threading: dismissed for \(dismissedFor)s, sid=\(self.sessionId ?? "nil", privacy: .public), msgs=\(self.messages.count)")
+        }
+        lastDismissedAt = nil
     }
 
     /// Replace the current conversation with one loaded from the daemon.
@@ -114,7 +134,7 @@ final class ChatSession {
         }
         status = .ready
         lastTurnMeta = nil
-        lastInteractionAt = Date()
+        lastDismissedAt = nil
     }
 
     func cancel() {
@@ -135,7 +155,6 @@ final class ChatSession {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         cancel()
-        lastInteractionAt = Date()
 
         let userMsg = ChatMessage(role: .user, text: trimmed)
         let asstMsg = ChatMessage(role: .assistant, text: "", isStreaming: true)
@@ -182,6 +201,15 @@ final class ChatSession {
                 step: tool.step, name: tool.name, result: tool.result,
                 latencyMs: tool.latencyMs, isError: tool.isError
             ))
+        case .thinking(let text):
+            chatLog.debug("evt thinking: \(text.count) chars")
+            // Stamp time-to-first-output on the first thinking *or* token
+            // delta (thinking models stream reasoning before the answer, so
+            // excluding it would over-attribute prefill latency).
+            if asstMsg.timeToFirstTokenMs == nil {
+                asstMsg.timeToFirstTokenMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+            }
+            asstMsg.thinking.append(text)
         case .token(let text):
             chatLog.debug("evt token: \(text.count) chars")
             if asstMsg.timeToFirstTokenMs == nil {

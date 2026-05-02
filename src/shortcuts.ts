@@ -19,12 +19,21 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import type { ShortcutMetaStore, Intent } from "./shortcut_meta";
+
 const SHORTCUTS_BIN = "/usr/bin/shortcuts";
 const LIST_CACHE_TTL_MS = 30_000;
 const DEFAULT_RUN_TIMEOUT_MS = 30_000;
 
 export type ShortcutEntry = {
   name: string;
+  /** Present when a ShortcutMetaStore is wired in. The agent picks shortcuts
+   *  by intent; this surfaces it. Absent → caller should treat as `other`
+   *  (no preferential routing). */
+  intent?: Intent;
+  /** True when this is the user's default for its intent. Surfaced so the
+   *  prompt builder can mark it in the model's view. */
+  isDefault?: boolean;
 };
 
 export type RunErrorKind = "missing" | "permission" | "timeout" | "exit" | "spawn";
@@ -37,12 +46,34 @@ export type ListShortcutsResult =
   | { ok: true; shortcuts: ShortcutEntry[]; cachedAt: number; fromCache: boolean }
   | { ok: false; error: string };
 
+/** Optional metadata layer the caller wires in. When present, list/cachedNames
+ *  return entries enriched with intent + isDefault. The store gets diff-and-
+ *  filled (new names classified, removed names GC'd) on every cache miss. */
+export type ShortcutMetaBinding = {
+  store: ShortcutMetaStore;
+  classify: (name: string) => Promise<Intent>;
+  /** Optional log callback so the server can surface meta sync events. */
+  onSync?: (info: { added: number; removed: number; total: number }) => void;
+};
+
 export class ShortcutsClient {
   private cache: { at: number; shortcuts: ShortcutEntry[] } | null = null;
+  private metaBinding: ShortcutMetaBinding | null = null;
+
+  /** Wire a metadata store. Calling this AFTER cache exists invalidates
+   *  the cache so the next list() refreshes with metadata. */
+  setMetaBinding(binding: ShortcutMetaBinding): void {
+    this.metaBinding = binding;
+    this.cache = null;
+  }
 
   /**
    * List the user's installed shortcuts. Cached for LIST_CACHE_TTL_MS so
    * the Mac app can repaint without re-spawning the CLI per render.
+   *
+   * When a metadata binding is wired, every cache miss also runs a
+   * diff-and-fill against the meta store: new names get classified,
+   * removed names get GC'd. Returned entries carry intent + isDefault.
    */
   async list(opts: { force?: boolean } = {}): Promise<ListShortcutsResult> {
     const now = Date.now();
@@ -67,7 +98,19 @@ export class ShortcutsClient {
       .split("\n")
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
-    const shortcuts = names.map((name) => ({ name }));
+
+    let shortcuts: ShortcutEntry[];
+    if (this.metaBinding) {
+      // Bring the meta store up to date with the live library, then enrich.
+      const sync = await this.metaBinding.store.syncWithLibrary(names, this.metaBinding.classify);
+      this.metaBinding.onSync?.({ added: sync.added, removed: sync.removed, total: names.length });
+      shortcuts = names.map((name) => {
+        const m = this.metaBinding!.store.get(name);
+        return { name, intent: m?.intent, isDefault: m?.isDefault };
+      });
+    } else {
+      shortcuts = names.map((name) => ({ name }));
+    }
 
     this.cache = { at: now, shortcuts };
     return { ok: true, shortcuts, cachedAt: now, fromCache: false };
@@ -157,25 +200,55 @@ export class ShortcutsClient {
   async fuzzyMatches(query: string, n = 5): Promise<string[]> {
     const list = await this.list();
     if (!list.ok) return [];
-    const q = query.toLowerCase();
-    // 0.25 is a deliberate compromise: low enough that "Set Tymer" still
-    // surfaces "Start pomodoro timer" (overlap ~0.3 once length differs);
-    // high enough to drop the worst long-tail noise. Suggestions are a
-    // hint, not the only signal — the full available-list is also in the
-    // error string, so a borderline-relevant suggestion costs nothing.
-    const MIN_SIM = 0.25;
-    return list.shortcuts
-      .map((s) => ({ name: s.name, score: similarity(q, s.name.toLowerCase()) }))
-      .filter((s) => s.score >= MIN_SIM)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, n)
-      .map((s) => s.name);
+    return rankShortcutsByFuzzy(query, list.shortcuts.map((s) => s.name), n);
   }
 
   /** Force a reload on the next list() call. */
   invalidateCache(): void {
     this.cache = null;
   }
+
+  /**
+   * Synchronous read of the most recently cached names. Returns null if
+   * the cache is empty or stale (older than LIST_CACHE_TTL_MS).
+   *
+   * Used by the system-prompt builder so the model sees real shortcut
+   * names ambient — no separate list_shortcuts round-trip required to
+   * make a first-attempt run_shortcut call land on a real name.
+   */
+  cachedNames(): string[] | null {
+    if (!this.cache) return null;
+    if (Date.now() - this.cache.at > LIST_CACHE_TTL_MS) return null;
+    return this.cache.shortcuts.map((s) => s.name);
+  }
+
+  /** Synchronous read of cached entries WITH intent + default flags when a
+   *  meta binding is wired. Used by the system-prompt builder to render
+   *  the shortcut list with metadata so the model picks by intent. */
+  cachedEntries(): ShortcutEntry[] | null {
+    if (!this.cache) return null;
+    if (Date.now() - this.cache.at > LIST_CACHE_TTL_MS) return null;
+    return [...this.cache.shortcuts];
+  }
+}
+
+/**
+ * Rank a list of shortcut names against a query and return the top-N most
+ * similar — exported so tests / evals can call the exact ranking the agent
+ * sees, without spawning the macOS `shortcuts` CLI.
+ *
+ * 0.25 is a deliberate min-similarity compromise: low enough that "Set
+ * Tymer" still surfaces "Start Pomodoro Timer" (overlap ~0.3 once length
+ * differs); high enough to drop the worst long-tail noise.
+ */
+export function rankShortcutsByFuzzy(query: string, names: string[], n = 5, minSim = 0.25): string[] {
+  const q = query.toLowerCase();
+  return names
+    .map((name) => ({ name, score: similarity(q, name.toLowerCase()) }))
+    .filter((s) => s.score >= minSim)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, n)
+    .map((s) => s.name);
 }
 
 function classifyError(msg: string): RunErrorKind {

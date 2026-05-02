@@ -110,19 +110,145 @@ struct DockChatView: View {
 
     // MARK: - Empty placeholder
 
+    /// Concrete starter prompts that map to the runtime's tool surface —
+    /// each one will route through search_corpus / list_notes / get_current_time
+    /// / remember etc. when the model decides what to call.
+    private static let suggestions: [(icon: String, prompt: String)] = [
+        ("clock",          "What time is it?"),
+        ("note.text",      "Show me my recent notes"),
+        ("brain",          "What do you remember about me?"),
+        ("pencil.line",    "Help me draft a quick note"),
+    ]
+
     private var emptyState: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 14) {
             Text("Ask anything — your conversations stay on this device.")
                 .font(.haloUI(13))
                 .foregroundStyle(Color.haloFgDim)
                 .multilineTextAlignment(.center)
+
+            FlowLayout(spacing: 6, alignment: .center) {
+                ForEach(Self.suggestions, id: \.prompt) { suggestion in
+                    SuggestionChip(
+                        icon: suggestion.icon,
+                        text: suggestion.prompt,
+                        action: { state.chat.send(suggestion.prompt) }
+                    )
+                }
+            }
+            .padding(.horizontal, 12)
+
             if !runtimeStatus.connected {
                 Text("Runtime daemon offline · run `bun run server`")
                     .font(.haloMono(10.5))
                     .foregroundStyle(Color.haloFgFaint)
             }
         }
-        .frame(maxWidth: .infinity, minHeight: 60)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.top, 8)
+    }
+}
+
+// MARK: - Suggestion chip
+
+/// Compact capsule shown in the empty state. Click → sends the prompt.
+private struct SuggestionChip: View {
+    let icon: String
+    let text: String
+    let action: () -> Void
+
+    @State private var hovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(Color.haloAccent)
+                Text(text)
+                    .font(.haloUI(12))
+                    .foregroundStyle(Color.haloFg)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                Capsule().fill(Color.white.opacity(hovered ? 0.10 : 0.05))
+            )
+            .overlay(
+                Capsule().stroke(Color.white.opacity(hovered ? 0.22 : 0.12), lineWidth: 0.5)
+            )
+            .animation(.easeOut(duration: 0.10), value: hovered)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
+    }
+}
+
+// MARK: - Flow layout (wraps capsules across rows)
+
+/// Lightweight horizontal flow layout — fills each row left-to-right and
+/// wraps to a new row when the next subview wouldn't fit. Used for the
+/// suggestion chips so the prompts wrap naturally on narrow widths.
+private struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+    var alignment: HorizontalAlignment = .center
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var rows = layout(subviews: subviews, maxWidth: maxWidth)
+        let height = rows.map(\.height).reduce(0, +)
+            + CGFloat(max(0, rows.count - 1)) * spacing
+        let width  = rows.map(\.width).max() ?? 0
+        rows.removeAll()
+        return CGSize(width: width, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let rows = layout(subviews: subviews, maxWidth: bounds.width)
+        var y = bounds.minY
+        for row in rows {
+            let rowOriginX: CGFloat = {
+                switch alignment {
+                case .leading:  return bounds.minX
+                case .trailing: return bounds.maxX - row.width
+                default:        return bounds.minX + (bounds.width - row.width) / 2
+                }
+            }()
+            var x = rowOriginX
+            for item in row.items {
+                subviews[item.index].place(
+                    at: CGPoint(x: x, y: y),
+                    proposal: ProposedViewSize(item.size)
+                )
+                x += item.size.width + spacing
+            }
+            y += row.height + spacing
+        }
+    }
+
+    // MARK: helpers
+
+    private struct Row { var items: [Item] = []; var width: CGFloat = 0; var height: CGFloat = 0 }
+    private struct Item { let index: Int; let size: CGSize }
+
+    private func layout(subviews: Subviews, maxWidth: CGFloat) -> [Row] {
+        var rows: [Row] = []
+        var current = Row()
+        for (i, subview) in subviews.enumerated() {
+            let size = subview.sizeThatFits(.unspecified)
+            let next = current.width + (current.items.isEmpty ? 0 : spacing) + size.width
+            if next > maxWidth, !current.items.isEmpty {
+                rows.append(current)
+                current = Row()
+            }
+            current.items.append(Item(index: i, size: size))
+            current.width  = current.items.count == 1 ? size.width : current.width + spacing + size.width
+            current.height = max(current.height, size.height)
+        }
+        if !current.items.isEmpty { rows.append(current) }
+        return rows
     }
 }
 
@@ -147,6 +273,10 @@ private struct MessageRow: View {
             }
         } else {
             VStack(alignment: .leading, spacing: 8) {
+                if !message.thinking.isEmpty {
+                    ThinkingBlock(message: message)
+                }
+
                 if !message.toolCalls.isEmpty {
                     VStack(spacing: 0) {
                         ForEach(message.toolCalls) { trace in
@@ -165,7 +295,7 @@ private struct MessageRow: View {
                 if !message.text.isEmpty {
                     replyText
                     MessageMetaStrip(message: message)
-                } else if message.isStreaming && message.toolCalls.isEmpty {
+                } else if message.isStreaming && message.toolCalls.isEmpty && message.thinking.isEmpty {
                     ThinkingIndicator()
                 }
             }
@@ -277,6 +407,89 @@ private struct ThinkingIndicator: View {
             .font(.haloUI(15))
             .foregroundStyle(Color.haloFgFaint)
         }
+    }
+}
+
+// MARK: - Thinking-mode reasoning trace
+//
+// Collapsible block above the assistant reply. Header shows token count and
+// status; body is dim/italic so it visually recedes vs the answer. Auto-
+// expanded while reasoning is actively streaming, auto-collapsed once the
+// answer text starts arriving (and stays collapsed in the archive view).
+// Click the header to toggle manually.
+private struct ThinkingBlock: View {
+    @Bindable var message: ChatMessage
+    @State private var manualOverride: Bool? = nil
+    @State private var hovered = false
+
+    /// Default expansion: true while we're still streaming reasoning AND no
+    /// answer text has arrived yet. Once `message.text` is non-empty the
+    /// answer is the focus, so collapse. User toggle wins via `manualOverride`.
+    private var isExpanded: Bool {
+        if let m = manualOverride { return m }
+        if !message.isStreaming { return false }
+        return message.text.isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            if isExpanded { body_ }
+        }
+        .background(Color.white.opacity(0.02))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private var header: some View {
+        Button(action: { manualOverride = !isExpanded }) {
+            HStack(spacing: 8) {
+                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(Color.haloFgFaint)
+                    .frame(width: 10)
+
+                Text(headerLabel)
+                    .font(.haloUI(11, weight: .medium))
+                    .tracking(0.4)
+                    .foregroundStyle(Color.haloFgDim)
+
+                Spacer(minLength: 0)
+
+                Text("\(message.thinking.count)c")
+                    .font(.haloMono(10))
+                    .foregroundStyle(Color.haloFgFaint)
+                    .monospacedDigit()
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .contentShape(Rectangle())
+            .background(Color.white.opacity(hovered ? 0.03 : 0))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
+    }
+
+    /// "Thinking…" while still streaming reasoning, "Thought" once done.
+    private var headerLabel: String {
+        if message.isStreaming && message.text.isEmpty { return "Thinking…" }
+        return "Thought"
+    }
+
+    private var body_: some View {
+        Text(message.thinking)
+            .font(.haloUI(12))
+            .italic()
+            .foregroundStyle(Color.haloFgDim)
+            .lineSpacing(2)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12).padding(.bottom, 10).padding(.top, 2)
+            .overlay(alignment: .top) {
+                Rectangle().fill(Color.white.opacity(0.06)).frame(height: 0.5)
+            }
     }
 }
 

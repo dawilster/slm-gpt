@@ -18,12 +18,23 @@ import type { CompletionOptions, ModelClient, ToolCallReq } from "./client";
 import type { Context } from "./context";
 import type { Session } from "./sessions";
 import { validateArgs, type ToolRegistry } from "./tools";
+import { parseSyntheticToolCalls } from "./synthetic_calls";
 
 export type TurnResult = {
   reply: string;
   promptTokens: number;
   completionTokens: number;
   latencyMs: number;
+  /** Total prefill time across every model round-trip in this turn. Streaming
+   *  only — measured as time-to-first-token. Dominant cost on local SLMs
+   *  when the prompt is long, so worth tracking separately. */
+  prefillMs: number;
+  /** Total generation time = latency - prefill. */
+  generationMs: number;
+  /** Concatenated reasoning trace from thinking-mode models. Empty string
+   *  when the model didn't emit any. Multiple round-trips (tool-calling
+   *  loop) get joined with separators. */
+  thinking: string;
   /** number of messages actually sent on the LAST round-trip after budget trim */
   sentMessages: number;
   /** total messages held in context (incl. system) */
@@ -61,6 +72,25 @@ export type ChatOptions = CompletionOptions & {
    * tokens — never partial tool invocations.
    */
   onToken?: (text: string) => void;
+  /**
+   * Thinking-token observer. Fires when a thinking-mode model emits
+   * reasoning content (LM Studio's `delta.reasoning_content`). Separate
+   * from `onToken` so the UI can render the trace in a collapsible block.
+   */
+  onThinking?: (text: string) => void;
+  /**
+   * Last-resort hook fired when the model emits a tool call whose name
+   * isn't in the registry. The handler can synthesize a result (e.g. by
+   * routing the call to a real tool whose name fuzzy-matches) — return
+   * a string to use as the tool result, or null to fall through to the
+   * standard "tool not registered" error message.
+   *
+   * This is the §5.1-style runtime mitigation for the "tool-name as
+   * function-call" 4B failure mode: the model treats a shortcut name
+   * as a tool name instead of as the `name` argument to run_shortcut.
+   * The runtime catches the shape and routes it correctly.
+   */
+  unknownToolFallback?: (tc: ToolCallReq) => Promise<string | null>;
 };
 
 const DEFAULT_MAX_STEPS = 8;
@@ -95,10 +125,13 @@ export class Assistant {
     let totalIn = 0;
     let totalOut = 0;
     let totalLatency = 0;
+    let totalPrefill = 0;
+    let totalGeneration = 0;
     let toolCallsExecuted = 0;
     let steps = 0;
     let lastSent = 0;
     let lastTrimmed = false;
+    let totalThinking = "";
 
     while (steps < maxSteps) {
       steps++;
@@ -108,11 +141,29 @@ export class Assistant {
       lastTrimmed = lastSent < this.context.all().length;
 
       const result = options.onToken
-        ? await this.client.completeStreaming(messagesToSend, { ...options, tools, onToken: options.onToken })
+        ? await this.client.completeStreaming(messagesToSend, {
+            ...options,
+            tools,
+            onToken: options.onToken,
+            onThinking: options.onThinking,
+          })
         : await this.client.complete(messagesToSend, { ...options, tools });
       totalIn += result.usage.promptTokens;
       totalOut += result.usage.completionTokens;
       totalLatency += result.latencyMs;
+      if (result.thinking) {
+        totalThinking += (totalThinking.length > 0 ? "\n\n--- step ---\n\n" : "") + result.thinking;
+      }
+      // firstTokenMs is streaming-only. When present, that interval is prefill;
+      // the remainder is generation. When absent (non-streaming branch), we
+      // can't split, so the whole step counts as generation — non-streaming
+      // is the eval-only path so the bias is acceptable.
+      if (typeof result.firstTokenMs === "number") {
+        totalPrefill += result.firstTokenMs;
+        totalGeneration += Math.max(0, result.latencyMs - result.firstTokenMs);
+      } else {
+        totalGeneration += result.latencyMs;
+      }
 
       // Tool-call branch: execute, append, loop.
       if (result.toolCalls && result.toolCalls.length > 0) {
@@ -130,7 +181,7 @@ export class Assistant {
         for (const tc of result.toolCalls) {
           toolCallsExecuted++;
           const start = Date.now();
-          const toolResult = await this.executeToolCall(tc);
+          const toolResult = await this.executeToolCall(tc, options.unknownToolFallback);
           const elapsed = Date.now() - start;
           this.context.addToolResult(tc.id, toolResult);
           await this.persistTurn({
@@ -141,6 +192,62 @@ export class Assistant {
           if (options.onToolCall) {
             // Parse args defensively — the model can produce malformed JSON
             // and we still want to surface that to the observer (as null).
+            let parsedArgs: Record<string, unknown> | null = {};
+            const raw = tc.function.arguments;
+            if (raw && raw.length > 0) {
+              try {
+                const p = JSON.parse(raw);
+                parsedArgs = (typeof p === "object" && p !== null && !Array.isArray(p))
+                  ? (p as Record<string, unknown>)
+                  : null;
+              } catch {
+                parsedArgs = null;
+              }
+            }
+            options.onToolCall({
+              step: steps,
+              name: tc.function.name,
+              args: parsedArgs,
+              result: toolResult,
+              latencyMs: elapsed,
+              isError: toolResult.startsWith("Error"),
+            });
+          }
+        }
+        continue;
+      }
+
+      // Synthetic-call recovery: some local SLMs emit tool calls as plain
+      // text (`run_shortcut("foo", "bar")`) rather than via the structured
+      // tool_calls API. Try to parse those out and treat them as if the
+      // model had used the API properly.
+      const synthetic = this.registry
+        ? parseSyntheticToolCalls(result.reply, this.registry)
+        : null;
+      if (synthetic && synthetic.calls.length > 0) {
+        this.context.addAssistantToolCalls(synthetic.preamble, synthetic.calls);
+        await this.persistTurn({
+          role: "assistant",
+          content: synthetic.preamble,
+          model: this.client.id,
+          promptTokens: result.usage.promptTokens,
+          completionTokens: result.usage.completionTokens,
+          latencyMs: result.latencyMs,
+          toolCalls: synthetic.calls.map((tc) => ({ ...tc })),
+        });
+
+        for (const tc of synthetic.calls) {
+          toolCallsExecuted++;
+          const start = Date.now();
+          const toolResult = await this.executeToolCall(tc, options.unknownToolFallback);
+          const elapsed = Date.now() - start;
+          this.context.addToolResult(tc.id, toolResult);
+          await this.persistTurn({
+            role: "tool",
+            content: toolResult,
+            toolCallId: tc.id,
+          });
+          if (options.onToolCall) {
             let parsedArgs: Record<string, unknown> | null = {};
             const raw = tc.function.arguments;
             if (raw && raw.length > 0) {
@@ -183,6 +290,9 @@ export class Assistant {
         promptTokens: totalIn,
         completionTokens: totalOut,
         latencyMs: totalLatency,
+        prefillMs: totalPrefill,
+        generationMs: totalGeneration,
+        thinking: totalThinking,
         sentMessages: lastSent,
         totalMessages: this.context.all().length,
         trimmed: lastTrimmed,
@@ -210,6 +320,9 @@ export class Assistant {
       promptTokens: totalIn,
       completionTokens: totalOut,
       latencyMs: totalLatency,
+      prefillMs: totalPrefill,
+      generationMs: totalGeneration,
+      thinking: totalThinking,
       sentMessages: lastSent,
       totalMessages: this.context.all().length,
       trimmed: lastTrimmed,
@@ -218,9 +331,26 @@ export class Assistant {
     };
   }
 
-  private async executeToolCall(tc: ToolCallReq): Promise<string> {
+  private async executeToolCall(
+    tc: ToolCallReq,
+    unknownToolFallback?: (tc: ToolCallReq) => Promise<string | null>,
+  ): Promise<string> {
     const tool = this.registry?.get(tc.function.name);
     if (!tool) {
+      // Last-resort hook for the §5.1 "shortcut-name as tool-name" 4B
+      // failure mode (and similar). The server wires this to a function
+      // that fuzzy-matches the unknown name against the shortcuts cache
+      // and routes the call through run_shortcut transparently.
+      if (unknownToolFallback) {
+        try {
+          const synthesized = await unknownToolFallback(tc);
+          if (synthesized !== null && synthesized !== undefined) return synthesized;
+        } catch (e: any) {
+          // Fallback itself errored — log but don't crash; fall through
+          // to the standard error so the model gets a chance to retry.
+          console.warn(`[assistant] unknownToolFallback threw: ${e?.message ?? e}`);
+        }
+      }
       const available = this.registry ? this.registry.list().map((t) => t.definition.name).join(", ") : "(none)";
       return `Error: tool '${tc.function.name}' is not registered. Available tools: ${available}.`;
     }

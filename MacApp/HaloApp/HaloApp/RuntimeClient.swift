@@ -83,6 +83,10 @@ enum ChatEvent: Sendable {
     case session(id: String)
     case status(state: String)
     case tool(ChatToolEvent)
+    /// Reasoning-content delta from a thinking-mode model (Qwen 3.5 +
+    /// HALO_THINKING=1). Distinct from `.token` so the UI can render the
+    /// trace in a separate (collapsible) surface.
+    case thinking(text: String)
     case token(text: String)
     case done(ChatDoneEvent)
     case error(message: String)
@@ -342,6 +346,10 @@ private final class SSEStreamDelegate: NSObject, URLSessionDataDelegate, @unchec
             struct T: Decodable { let text: String }
             return (try? decoder.decode(T.self, from: data))
                 .map { .token(text: $0.text) }
+        case "thinking":
+            struct T: Decodable { let text: String }
+            return (try? decoder.decode(T.self, from: data))
+                .map { .thinking(text: $0.text) }
         case "done":
             return (try? decoder.decode(ChatDoneEvent.self, from: data))
                 .map { .done($0) }
