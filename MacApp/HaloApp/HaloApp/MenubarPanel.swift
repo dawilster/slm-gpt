@@ -13,6 +13,14 @@ func dismissMenubarPopover() {
     }
 }
 
+extension Notification.Name {
+    /// Posted by StatusBarController when the menubar panel is about to be
+    /// shown — MenubarPanelView reloads its recents list in response.
+    /// Needed because the panel's SwiftUI view stays mounted for the app's
+    /// lifetime, so `.task` runs only once at init.
+    static let haloMenubarPanelWillPresent = Notification.Name("haloMenubarPanelWillPresent")
+}
+
 extension ISO8601DateFormatter {
     /// Server emits timestamps with millisecond precision (e.g. 2026-04-30T...123Z),
     /// which the default `.iso8601` parser rejects — opt into fractional seconds.
@@ -54,6 +62,9 @@ struct MenubarPanelView: View {
         )
         .foregroundStyle(Color.haloFg)
         .task { await loadRecents() }
+        .onReceive(NotificationCenter.default.publisher(for: .haloMenubarPanelWillPresent)) { _ in
+            Task { await loadRecents() }
+        }
         .contextMenu {
             Button("Summon dock") {
                 dismissMenubarPopover()

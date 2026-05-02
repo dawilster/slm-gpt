@@ -140,6 +140,8 @@ final class DockWindowController: NSObject, NSWindowDelegate {
     }
 
     func dismiss() {
+        guard panel.isVisible else { return }
+        state.chat.markDismissed()
         panel.orderOut(nil)
     }
 

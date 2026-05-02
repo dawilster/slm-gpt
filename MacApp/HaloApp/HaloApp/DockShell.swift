@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 // MARK: - DockShell — shared chrome (status strip + body + input row)
 
@@ -88,7 +89,7 @@ struct DockInputRow: View {
     @FocusState private var focused: Bool
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(alignment: .top, spacing: 12) {
             // Mini orb
             Circle()
                 .fill(
@@ -107,20 +108,25 @@ struct DockInputRow: View {
                 .frame(width: 28, height: 28)
 
             TextField("", text: $text, prompt:
-                Text(placeholder).foregroundStyle(Color.haloFgFaint)
+                Text(placeholder).foregroundStyle(Color.haloFgFaint),
+                axis: .vertical
             )
             .textFieldStyle(.plain)
+            .lineLimit(1...8)
             .font(.haloUI(15))
             .foregroundStyle(Color.haloFg)
             .focused($focused)
             .disabled(disabled)
             .opacity(disabled ? 0.4 : 1)
-            .onSubmit {
-                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { return }
-                onSubmit(trimmed)
-                text = ""
+            // Chat-style submit: Return sends, Shift+Return inserts a newline.
+            // axis: .vertical otherwise treats Return as a literal newline,
+            // so we intercept here before TextField handles the keystroke.
+            .onKeyPress(.return, phases: .down) { keyPress in
+                if keyPress.modifiers.contains(.shift) { return .ignored }
+                submit()
+                return .handled
             }
+            .padding(.top, 5)
 
             if showHints {
                 HStack(spacing: 6) {
@@ -129,8 +135,9 @@ struct DockInputRow: View {
                         .font(.haloMono(10.5))
                         .foregroundStyle(Color.haloFgFaint)
                 }
+                .padding(.top, 7)
             }
-            InlineKey(text: "↵")
+            InlineKey(text: "↵").padding(.top, 7)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -138,12 +145,20 @@ struct DockInputRow: View {
             Rectangle().fill(Color.white.opacity(0.06)).frame(height: 0.5)
         }
         .onAppear {
-            // Auto-focus when the dock summons.
-            if !disabled {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    focused = true
-                }
-            }
+            if !disabled { focused = true }
         }
+        // Re-focus on every summon — the SwiftUI view may already exist when
+        // the dock is shown again, so .onAppear alone won't fire.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
+            guard !disabled, note.object is HaloDockPanel else { return }
+            focused = true
+        }
+    }
+
+    private func submit() {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        onSubmit(trimmed)
+        text = ""
     }
 }

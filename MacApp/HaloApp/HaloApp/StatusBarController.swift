@@ -170,6 +170,10 @@ final class StatusBarController: NSObject, NSWindowDelegate {
         guard let button = statusItem.button,
               let buttonWindow = button.window else { return }
 
+        // The SwiftUI panel view stays mounted for the app's lifetime, so
+        // its `.task` only runs once. Nudge it to reload recents now.
+        NotificationCenter.default.post(name: .haloMenubarPanelWillPresent, object: nil)
+
         let fittingHeight = max(host.fittingSize.height, 200)
         panel.setContentSize(NSSize(width: HaloMetrics.panelWidth, height: fittingHeight))
 
