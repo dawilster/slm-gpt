@@ -49,6 +49,9 @@ import {
 const BASE_URL = process.env.MODEL_BASE_URL ?? "http://localhost:1234/v1";
 const API_KEY  = process.env.MODEL_API_KEY  ?? "lm-studio";
 const TEST_ROOT = join(tmpdir(), `assistant-v6_5-test-${process.pid}-${Date.now()}`);
+// Mirror the server's HALO_THINKING toggle so the eval can be run against
+// thinking-mode models (Qwen 3.5+) for apples-to-apples comparison.
+const THINKING = process.env.HALO_THINKING === "1";
 
 // Fixture library — same names as before, now with intent metadata to mirror
 // what the real ShortcutMetaStore would produce. This is the typed contract
@@ -233,7 +236,7 @@ async function runSimple(model: string) {
   for (const c of SIMPLE_CASES) {
     const mock = new MockShortcutsClient();
     const { assistant } = newAssistant(model, mock);
-    const r = await assistant.chat(c.prompt);
+    const r = await assistant.chat(c.prompt, { enableThinking: THINKING, onToken: () => {} });
     const calls = RUN_CALL(toolCallsInLastTurn(assistant.state));
     const matched = calls.find((tc) => tc.args.name === c.expectedName);
     const inputOk = c.expectsInput ? Boolean(matched?.args.input && String(matched.args.input).trim().length > 0) : true;
@@ -285,7 +288,7 @@ async function runNaming(model: string) {
   for (const c of NAMING_CASES) {
     const mock = new MockShortcutsClient();
     const { assistant } = newAssistant(model, mock);
-    const r = await assistant.chat(c.prompt);
+    const r = await assistant.chat(c.prompt, { enableThinking: THINKING, onToken: () => {} });
     const calls = RUN_CALL(toolCallsInLastTurn(assistant.state));
     const finalSuccess = calls.find((tc) => tc.result.startsWith("Ran"));
     const passed = Boolean(finalSuccess && finalSuccess.args.name === c.expectedName);
@@ -329,7 +332,7 @@ async function runContent(model: string) {
   for (const c of CONTENT_CASES) {
     const mock = new MockShortcutsClient();
     const { assistant } = newAssistant(model, mock, { notes_app: "Create Note with Date" });
-    const r = await assistant.chat(c.prompt);
+    const r = await assistant.chat(c.prompt, { enableThinking: THINKING, onToken: () => {} });
     const calls = RUN_CALL(toolCallsInLastTurn(assistant.state));
     const matched = calls.find((tc) => tc.args.name === c.expectedName && typeof tc.args.input === "string");
     const input = (matched?.args.input as string | undefined) ?? "";
@@ -399,7 +402,7 @@ async function runRich(model: string) {
   for (const c of RICH_CASES) {
     const mock = new MockShortcutsClient();
     const { assistant } = newAssistant(model, mock, { notes_app: "Create Note with Date" });
-    const r = await assistant.chat(c.prompt);
+    const r = await assistant.chat(c.prompt, { enableThinking: THINKING, onToken: () => {} });
     const calls = RUN_CALL(toolCallsInLastTurn(assistant.state));
     const matched = calls.find((tc) => tc.args.name === c.expectedName && typeof tc.args.input === "string");
     if (!matched) {
@@ -438,7 +441,7 @@ async function runChain(model: string) {
   for (const c of CHAIN_CASES) {
     const mock = new MockShortcutsClient();
     const { assistant } = newAssistant(model, mock, { notes_app: "Create Note with Date" });
-    const r = await assistant.chat(c.prompt, { maxSteps: 8 });
+    const r = await assistant.chat(c.prompt, { maxSteps: 8, enableThinking: THINKING, onToken: () => {} });
     const calls = RUN_CALL(toolCallsInLastTurn(assistant.state));
     const successfulNames = calls
       .filter((tc) => tc.result.startsWith("Ran"))
@@ -469,7 +472,7 @@ async function runSkip(model: string) {
   for (const c of SKIP_CASES) {
     const mock = new MockShortcutsClient();
     const { assistant } = newAssistant(model, mock);
-    const r = await assistant.chat(c.prompt);
+    const r = await assistant.chat(c.prompt, { enableThinking: THINKING, onToken: () => {} });
     const ranAny = mock.runCalls.length > 0;
     const passed = !ranAny;
     const detail = passed
@@ -512,7 +515,7 @@ async function _runDisambiguation_DELETED(model: string) {
   // We accept either as a pass — what we DON'T accept is acting silently
   // without saving any preference, which leaves us no better off next time.
   ctx.setSystemPrompt(buildSystemPrompt(FIXTURE_ENTRIES, profile));
-  const r1 = await assistant.chat("create a note");
+  const r1 = await assistant.chat("create a note", { enableThinking: THINKING, onToken: () => {} });
   const t1Calls = toolCallsInLastTurn(ctx);
   const t1Run = t1Calls.filter((c) => c.name === "run_shortcut");
   const t1Remember = t1Calls.filter((c) => c.name === "remember");
@@ -532,7 +535,7 @@ async function _runDisambiguation_DELETED(model: string) {
   // If T1 already remembered AND ran, this turn is a follow-up that should
   // not re-ask anything.
   ctx.setSystemPrompt(buildSystemPrompt(FIXTURE_ENTRIES, profile));
-  const r2 = await assistant.chat("Apple Notes please. Note body: morning run was great.");
+  const r2 = await assistant.chat("Apple Notes please. Note body: morning run was great.", { enableThinking: THINKING, onToken: () => {} });
   const t2Calls = toolCallsInLastTurn(ctx);
   const t2Remember = t2Calls.filter((c) => c.name === "remember");
   const t2Run = t2Calls.filter((c) => c.name === "run_shortcut");
@@ -549,7 +552,7 @@ async function _runDisambiguation_DELETED(model: string) {
   // ── Turn 3: ambiguous-shape request — should use saved pref silently
   // (no question mark in reply).
   ctx.setSystemPrompt(buildSystemPrompt(FIXTURE_ENTRIES, profile));
-  const r3 = await assistant.chat("save another quick note: lunch was good");
+  const r3 = await assistant.chat("save another quick note: lunch was good", { enableThinking: THINKING, onToken: () => {} });
   const t3Calls = toolCallsInLastTurn(ctx);
   const t3Run = t3Calls.filter((c) => c.name === "run_shortcut");
   const askedAgain = /\?/.test(r3.reply);
