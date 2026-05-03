@@ -176,6 +176,7 @@ export class Assistant {
           completionTokens: result.usage.completionTokens,
           latencyMs: result.latencyMs,
           toolCalls: result.toolCalls.map((tc) => ({ ...tc })),
+          thinking: result.thinking || undefined,
         });
 
         for (const tc of result.toolCalls) {
@@ -234,6 +235,7 @@ export class Assistant {
           completionTokens: result.usage.completionTokens,
           latencyMs: result.latencyMs,
           toolCalls: synthetic.calls.map((tc) => ({ ...tc })),
+          thinking: result.thinking || undefined,
         });
 
         for (const tc of synthetic.calls) {
@@ -283,6 +285,7 @@ export class Assistant {
         promptTokens: result.usage.promptTokens,
         completionTokens: result.usage.completionTokens,
         latencyMs: result.latencyMs,
+        thinking: result.thinking || undefined,
       });
 
       return {
@@ -313,6 +316,7 @@ export class Assistant {
       promptTokens: totalIn,
       completionTokens: totalOut,
       latencyMs: totalLatency,
+      thinking: totalThinking || undefined,
     });
 
     return {
@@ -380,6 +384,7 @@ export class Assistant {
     latencyMs?: number;
     toolCalls?: ToolCallReq[];
     toolCallId?: string;
+    thinking?: string;
   }): Promise<void> {
     if (!this.session) return;
     try {

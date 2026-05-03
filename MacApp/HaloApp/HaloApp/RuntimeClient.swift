@@ -71,6 +71,10 @@ struct SessionTurn: Decodable, Sendable, Equatable {
     let role: String      // "user" | "assistant"
     let text: String
     let ts: String
+    /// Cumulative reasoning trace for the round (joined across tool-call
+    /// sub-rounds with `--- step ---` separators by the server). Nil for
+    /// non-thinking models, older sessions, and user turns.
+    let thinking: String?
 }
 
 struct SessionDetailResponse: Decodable, Sendable {

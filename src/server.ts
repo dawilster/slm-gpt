@@ -548,20 +548,46 @@ const server = Bun.serve({
       return respond(json({ sessions: list }), `(${list.length} sessions, limit=${limit})`);
     }
 
-    // GET /v1/sessions/<id> — full transcript (user + assistant messages
-    // only; system + tool turns are internal and not displayed).
+    // GET /v1/sessions/<id> — full transcript.
+    //
+    // System + tool turns are internal and dropped. Multiple assistant
+    // turn records can belong to a single user→assistant "round" (the
+    // model emits a tool-calling assistant turn, then a terminal text
+    // turn, possibly with several rounds of each). On the wire we
+    // collapse each round back to one assistant message so the loaded
+    // view matches what the user saw live: one bubble per round, with
+    // cumulative thinking across all of its rounds and the model's
+    // reply text concatenated in arrival order.
     if (req.method === "GET" && url.pathname.startsWith("/v1/sessions/")) {
       const idOrPrefix = decodeURIComponent(url.pathname.slice("/v1/sessions/".length));
       const id = await store.findByPrefix(idOrPrefix);
       if (!id) return respond(json({ error: "session not found" }, { status: 404 }), `prefix=${idOrPrefix}`);
       const turns = await store.loadTurns(id);
-      const messages = turns
-        .filter((t) => t.role === "user" || t.role === "assistant")
-        .map((t) => ({
-          role: t.role as "user" | "assistant",
-          text: t.content,
-          ts: t.ts,
-        }));
+      type WireMsg = { role: "user" | "assistant"; text: string; ts: string; thinking?: string };
+      const messages: WireMsg[] = [];
+      for (const t of turns) {
+        if (t.role !== "user" && t.role !== "assistant") continue;
+        const last = messages[messages.length - 1];
+        if (t.role === "assistant" && last?.role === "assistant") {
+          // Same round — fold into the previous assistant message.
+          if (t.content && t.content.length > 0) {
+            last.text = last.text.length > 0 ? `${last.text}\n\n${t.content}` : t.content;
+          }
+          if (t.thinking && t.thinking.length > 0) {
+            last.thinking = last.thinking
+              ? `${last.thinking}\n\n--- step ---\n\n${t.thinking}`
+              : t.thinking;
+          }
+          last.ts = t.ts;
+        } else {
+          messages.push({
+            role: t.role,
+            text: t.content,
+            ts: t.ts,
+            thinking: t.thinking && t.thinking.length > 0 ? t.thinking : undefined,
+          });
+        }
+      }
       const meta = await store.metadataFor(id);
       return respond(json({ id, messages, meta }), `sid=${shortSid(id)} turns=${messages.length}`);
     }

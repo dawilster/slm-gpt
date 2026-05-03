@@ -128,9 +128,13 @@ final class ChatSession {
     func load(_ detail: SessionDetailResponse) {
         cancel()
         sessionId = detail.id
-        messages = detail.messages.map {
-            let role: ChatRole = $0.role == "user" ? .user : .assistant
-            return ChatMessage(role: role, text: $0.text, isStreaming: false)
+        messages = detail.messages.map { turn in
+            let role: ChatRole = turn.role == "user" ? .user : .assistant
+            let msg = ChatMessage(role: role, text: turn.text, isStreaming: false)
+            if let thinking = turn.thinking, !thinking.isEmpty {
+                msg.thinking = thinking
+            }
+            return msg
         }
         status = .ready
         lastTurnMeta = nil

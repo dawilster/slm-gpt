@@ -33,6 +33,14 @@ export type TurnRecord = {
   completionTokens?: number;
   latencyMs?: number;
   toolCalls?: SavedToolCall[];
+  /**
+   * Reasoning trace from thinking-mode models (Qwen-3.5 with
+   * HALO_THINKING=1). Captured per-round so a multi-step turn that thinks
+   * before each tool call retains all of its reasoning. Absent for
+   * non-thinking models, for older sessions, and for any record where the
+   * model emitted no reasoning content.
+   */
+  thinking?: string;
   // tool-only:
   toolCallId?: string;
 };
