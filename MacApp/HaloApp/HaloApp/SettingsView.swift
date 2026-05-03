@@ -2,6 +2,7 @@ import SwiftUI
 
 /// Two-pane settings window: sidebar nav + content.
 struct SettingsView: View {
+    @Environment(AppState.self) private var state
     var onClose: () -> Void = {}
     @State private var selected: SettingsSection = .model
 
@@ -111,7 +112,18 @@ struct SettingsView: View {
     }
 
     private var activeModelCard: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let status = state.runtimeStatus
+        // Compose "<quant> · <size> · <ctx>" from whichever pieces the
+        // runtime gave us. When all three are missing we show a single
+        // dash rather than an empty line.
+        let subBits: [String] = [
+            status.quantization,
+            status.sizeLabel,
+            status.contextLabel.map { "\($0) context" },
+        ].compactMap { $0 }
+        let sub = subBits.isEmpty ? "—" : subBits.joined(separator: " · ")
+
+        return VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 12) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -119,26 +131,27 @@ struct SettingsView: View {
                             colors: [Color.haloAccent, Color(red: 0.55, green: 0.45, blue: 0.85)],
                             startPoint: .topLeading, endPoint: .bottomTrailing
                         ))
-                    Text("L3")
+                    Text(modelGlyph(for: status.modelLabel))
                         .font(.haloMono(11, weight: .semibold))
                         .foregroundStyle(.white)
                 }
                 .frame(width: 32, height: 32)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Llama 3.3 · 8B Instruct")
+                    Text(status.modelLabel)
                         .font(.haloUI(13, weight: .medium))
-                    Text("q4_K_M · 4.6 GB · 8K context")
+                        .lineLimit(1)
+                    Text(sub)
                         .font(.haloMono(10.5))
                         .foregroundStyle(Color.haloFgFaint)
                 }
                 Spacer(minLength: 0)
-                Text("Active")
+                Text(status.connected ? "Active" : "Offline")
                     .font(.haloMono(10))
-                    .foregroundStyle(Color.haloGreen)
+                    .foregroundStyle(status.connected ? Color.haloGreen : Color.haloFgFaint)
                     .padding(.horizontal, 8).padding(.vertical, 3)
-                    .background(Color.haloGreen.opacity(0.18))
-                    .overlay(Capsule().stroke(Color.haloGreen.opacity(0.35), lineWidth: 0.5))
+                    .background((status.connected ? Color.haloGreen : Color.haloFgFaint).opacity(0.18))
+                    .overlay(Capsule().stroke((status.connected ? Color.haloGreen : Color.haloFgFaint).opacity(0.35), lineWidth: 0.5))
                     .clipShape(Capsule())
             }
             .padding(.bottom, 12)
@@ -146,11 +159,23 @@ struct SettingsView: View {
             Rectangle().fill(Color.white.opacity(0.06)).frame(height: 0.5)
 
             HStack(alignment: .top, spacing: 10) {
-                StatView(label: "RAM", value: "3.8", unit: "GB")
+                StatView(
+                    label: "RAM",
+                    value: status.sizeNumber ?? "—",
+                    unit:  status.sizeNumber == nil ? "" : "GB"
+                )
                 Spacer()
-                StatView(label: "Speed", value: "42", unit: "tok/s")
+                StatView(
+                    label: "Speed",
+                    value: status.tpsNumber ?? "—",
+                    unit:  status.tpsNumber == nil ? "" : "tok/s"
+                )
                 Spacer()
-                StatView(label: "Last used", value: "Just now", unit: "")
+                StatView(
+                    label: "Context",
+                    value: status.contextLabel ?? "—",
+                    unit:  ""
+                )
             }
             .padding(.top, 12)
         }
@@ -161,6 +186,18 @@ struct SettingsView: View {
                 .stroke(Color.white.opacity(0.10), lineWidth: 0.5)
         )
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    /// 2-char glyph for the active-model badge. Picks the first letter and
+    /// the first digit from the model id — "qwen3.5-2b" → "Q3", "llama-3.3"
+    /// → "L3". Falls back to "··" when neither is available.
+    private func modelGlyph(for id: String) -> String {
+        let s = id.lowercased()
+        let letter = s.first { $0.isLetter }.map { String($0).uppercased() }
+        let digit  = s.first { $0.isNumber }.map { String($0) }
+        if let l = letter, let d = digit { return "\(l)\(d)" }
+        if let l = letter                { return l }
+        return "··"
     }
 
     // MARK: - Hotkey pane

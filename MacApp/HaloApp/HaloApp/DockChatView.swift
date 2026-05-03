@@ -549,8 +549,50 @@ struct RuntimeStatus: Equatable {
     var connected: Bool
     var modelLabel: String
     var contextHint: String?
+    /// Raw context window in tokens (e.g. 8192). Null when unknown.
+    var contextLimit: Int? = nil
+    /// Loaded model size in bytes — drives the size + RAM stats. Null when
+    /// the runtime daemon couldn't probe `lms ps`. Displayed as "~N GB"
+    /// since loaded RAM ≈ file size on Apple Silicon (unified memory) but
+    /// isn't a precise live reading.
+    var sizeBytes: Int64? = nil
+    /// Rolling-average tok/s across recent turns. Null before the first turn.
+    /// Displayed as "~N tok/s" — averaged, not instantaneous.
+    var tokensPerSec: Double? = nil
+    var quantization: String? = nil
+    var paramsString: String? = nil
 
     static let offline = RuntimeStatus(connected: false, modelLabel: "(offline)", contextHint: nil)
+
+    /// "~3.8" — averaged label, paired with unit "GB" in StatView. The "~"
+    /// signals approximate / averaged across the model's lifetime. Nil → "—".
+    var sizeNumber: String? {
+        guard let b = sizeBytes, b > 0 else { return nil }
+        return String(format: "~%.1f", Double(b) / 1_000_000_000)
+    }
+
+    /// "~3.8 GB" — full label with unit, for places that don't split number
+    /// and unit (the model card's right-aligned size).
+    var sizeLabel: String? {
+        guard let n = sizeNumber else { return nil }
+        return "\(n) GB"
+    }
+
+    /// "~42" — rolling-avg tok/s. Nil when the runtime has handled no turns.
+    var tpsNumber: String? {
+        guard let v = tokensPerSec, v > 0 else { return nil }
+        return String(format: "~%.0f", v)
+    }
+
+    /// "8K" — context window rounded to nearest power-of-two thousand.
+    var contextLabel: String? {
+        guard let limit = contextLimit, limit > 0 else { return nil }
+        if limit >= 1024 {
+            let k = Double(limit) / 1024
+            return k == k.rounded() ? "\(Int(k))K" : String(format: "%.1fK", k)
+        }
+        return "\(limit)"
+    }
 }
 
 private struct RuntimeStatusKey: EnvironmentKey {

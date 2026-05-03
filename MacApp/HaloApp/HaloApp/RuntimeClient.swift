@@ -29,6 +29,19 @@ struct HealthResponse: Decodable, Sendable {
     let contextLimit: Int?
     let embeddings: String?
     let liveSessions: Int
+    /// Human-friendly name from `lms ps` (e.g. "Qwen3.5 2B"). Null when the
+    /// CLI probe couldn't run — clients should fall back to `model`.
+    let modelDisplay: String?
+    /// Quant tag from `lms ps` — "6bit", "Q4_K_M", etc.
+    let quantization: String?
+    /// Parameter count string from `lms ps` — "2B", "8B", "70B".
+    let paramsString: String?
+    /// Loaded model size in bytes (from `lms ps --json sizeBytes`).
+    let sizeBytes: Int64?
+    /// Rolling-average tokens/sec across recent turns. Null until the
+    /// runtime has handled at least one chat turn since boot. Displayed
+    /// as "~N tok/s" — it's an average, not an instantaneous reading.
+    let tokensPerSec: Double?
 }
 
 struct ProfileFact: Decodable, Identifiable, Sendable, Equatable {

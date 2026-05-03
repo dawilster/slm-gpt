@@ -121,23 +121,43 @@ struct MenubarPanelView: View {
                 .onHover { summonHovered = $0 }
             }
 
-            // Model card
+            // Model card — values stream off the runtime health probe
+            // (HaloAppApp.probeOnce runs every 3s) and the rolling tok/s
+            // buffer (updated after each chat turn). "—" while the runtime
+            // is offline or hasn't reported a number yet.
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline) {
-                    Text("llama-3.3-8b-q4")
+                    Text(state.runtimeStatus.modelLabel)
                         .font(.haloMono(11.5))
                         .foregroundStyle(Color.haloFg)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                     Spacer(minLength: 0)
-                    Text("4.6 GB")
+                    Text(state.runtimeStatus.sizeLabel ?? "—")
                         .font(.haloMono(10.5))
                         .foregroundStyle(Color.haloFgFaint)
                         .monospacedDigit()
                 }
-                HStack(alignment: .top, spacing: 12) {
-                    StatView(label: "RAM", value: "3.8", unit: "GB")
-                    StatView(label: "Speed", value: "42", unit: "tok/s")
-                    StatView(label: "Context", value: "8K", unit: "")
+                HStack(alignment: .top, spacing: 0) {
+                    StatView(
+                        label: "RAM",
+                        value: state.runtimeStatus.sizeNumber ?? "—",
+                        unit:  state.runtimeStatus.sizeNumber == nil ? "" : "GB"
+                    )
+                    Spacer(minLength: 8)
+                    StatView(
+                        label: "Speed",
+                        value: state.runtimeStatus.tpsNumber ?? "—",
+                        unit:  state.runtimeStatus.tpsNumber == nil ? "" : "tok/s"
+                    )
+                    Spacer(minLength: 8)
+                    StatView(
+                        label: "Context",
+                        value: state.runtimeStatus.contextLabel ?? "—",
+                        unit:  ""
+                    )
                 }
+                .frame(maxWidth: .infinity)
             }
             .padding(.horizontal, 12).padding(.vertical, 10)
             .background(Color.white.opacity(0.04))

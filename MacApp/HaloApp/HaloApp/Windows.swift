@@ -228,6 +228,7 @@ private struct DockHost: View {
                     .environment(\.runtimeStatus, state.runtimeStatus)
             case .shortcut:
                 DockShortcutView()
+                    .environment(\.runtimeStatus, state.runtimeStatus)
             }
         }
         .background(

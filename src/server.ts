@@ -28,7 +28,9 @@
  * profile, and corpus the REPL has.
  */
 
+import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { OpenAICompatClient, discoverModel, probeServerCapabilities } from "./client";
@@ -105,6 +107,109 @@ function logErr(...parts: unknown[]): void {
 }
 
 let requestCounter = 0;
+
+// ─── LM Studio CLI probe (model size, params, quant) ─────
+//
+// LM Studio's HTTP `/api/v0/models` endpoint exposes context length and
+// quant name, but not the loaded-model file size or parameter count. The
+// `lms` CLI does — `lms ps --json` returns a per-model object with
+// `sizeBytes`, `paramsString`, and friends. We shell out, cache the
+// result for a few seconds, and serve the merged shape on /v1/health.
+
+type LoadedModelInfo = {
+  identifier: string;       // matches the OpenAI-compat model id
+  displayName: string;
+  paramsString: string | null;
+  quantization: string | null;
+  sizeBytes: number;
+  contextLength: number;
+  status: string;
+};
+
+// Loaded-model info is essentially static for the lifetime of an LM Studio
+// load — sizeBytes, paramsString, and the configured context don't drift.
+// Cache long so we're not spawning `lms` on every health probe.
+const LMS_CACHE_TTL_MS = 60_000;
+let lmsCache: { at: number; data: LoadedModelInfo[] } | null = null;
+let lmsBinResolved: string | null = null;
+
+function resolveLmsBin(): string {
+  if (lmsBinResolved) return lmsBinResolved;
+  const override = process.env.LMS_BIN;
+  if (override && existsSync(override)) { lmsBinResolved = override; return override; }
+  const home = homedir();
+  for (const p of [`${home}/.lmstudio/bin/lms`, `${home}/.cache/lm-studio/bin/lms`]) {
+    if (existsSync(p)) { lmsBinResolved = p; return p; }
+  }
+  // Last resort — let Bun.spawn resolve via PATH; if that fails the probe
+  // returns [] and we serve null fields, which the client renders as "—".
+  lmsBinResolved = "lms";
+  return "lms";
+}
+
+async function probeLoadedModels(): Promise<LoadedModelInfo[]> {
+  const now = Date.now();
+  if (lmsCache && now - lmsCache.at < LMS_CACHE_TTL_MS) return lmsCache.data;
+
+  let data: LoadedModelInfo[] = [];
+  try {
+    const proc = Bun.spawn([resolveLmsBin(), "ps", "--json"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, code] = await Promise.all([
+      new Response(proc.stdout as ReadableStream<Uint8Array>).text(),
+      proc.exited,
+    ]);
+    if (code === 0 && stdout.trim().length > 0) {
+      const arr = JSON.parse(stdout) as Array<any>;
+      data = arr
+        .filter((m) => m && m.type !== "embeddings")
+        .map((m) => ({
+          identifier: String(m.identifier ?? m.modelKey ?? ""),
+          displayName: String(m.displayName ?? m.modelKey ?? ""),
+          paramsString: typeof m.paramsString === "string" ? m.paramsString : null,
+          quantization: typeof m.quantization?.name === "string" ? m.quantization.name : null,
+          sizeBytes: Number(m.sizeBytes ?? 0),
+          contextLength: Number(m.contextLength ?? m.maxContextLength ?? 0),
+          status: String(m.status ?? "unknown"),
+        }));
+    }
+  } catch {
+    // lms not installed / not on PATH / json schema drift — fall through to []
+  }
+  lmsCache = { at: now, data };
+  return data;
+}
+
+function findLoadedModel(modelId: string, models: LoadedModelInfo[]): LoadedModelInfo | null {
+  return models.find((m) => m.identifier === modelId) ?? models[0] ?? null;
+}
+
+// ─── Rolling tok/s tracker ───────────────────────────────
+//
+// Updated after each chat turn — the client polls /v1/health and shows
+// the rolling avg as the "Speed" stat. Bounded buffer so a slow run
+// from hours ago can't pollute the displayed number once you've used
+// the assistant a few times since. The UI shows this as "~N tok/s" to
+// signal it's an average across recent turns, not the instantaneous
+// rate of the current generation.
+
+const TPS_BUFFER_SIZE = 10;
+const tpsBuffer: number[] = [];
+
+function recordTps(tps: number): void {
+  if (!Number.isFinite(tps) || tps <= 0) return;
+  tpsBuffer.push(tps);
+  if (tpsBuffer.length > TPS_BUFFER_SIZE) tpsBuffer.shift();
+}
+
+function avgTps(): number | null {
+  if (tpsBuffer.length === 0) return null;
+  let sum = 0;
+  for (const v of tpsBuffer) sum += v;
+  return sum / tpsBuffer.length;
+}
 
 // Same base prompt as the REPL — kept in sync deliberately. If we move it to
 // a shared module, both index.ts and server.ts should switch together.
@@ -415,13 +520,24 @@ const server = Bun.serve({
 
     // GET /v1/health
     if (req.method === "GET" && url.pathname === "/v1/health") {
+      const loaded = await probeLoadedModels();
+      const me = findLoadedModel(modelId, loaded);
+      // contextLimit: prefer the live `lms ps` value (reflects the loaded
+      // ctx, which the user can change via LM Studio without restarting us),
+      // then fall back to the boot-time HTTP probe.
+      const ctxLimit = me?.contextLength || caps?.contextLimit || null;
       return respond(json({
         ok: true,
         port: PORT,
         model: modelId,
-        contextLimit: caps?.contextLimit ?? null,
+        contextLimit: ctxLimit,
         embeddings: embeddingModelId ?? null,
         liveSessions: liveAssistants.size,
+        modelDisplay: me?.displayName ?? null,
+        quantization: me?.quantization ?? null,
+        paramsString: me?.paramsString ?? null,
+        sizeBytes: me?.sizeBytes ?? null,
+        tokensPerSec: avgTps(),
       }));
     }
 
@@ -565,9 +681,11 @@ const server = Bun.serve({
           // tok/s is over generation time only — prefill is dominated by
           // prompt-eval and would dilute the number you actually care about
           // when comparing models.
-          const tps = result.generationMs > 0
-            ? (result.completionTokens * 1000 / result.generationMs).toFixed(1)
-            : "—";
+          const tpsNum = result.generationMs > 0
+            ? result.completionTokens * 1000 / result.generationMs
+            : 0;
+          recordTps(tpsNum);
+          const tps = tpsNum > 0 ? tpsNum.toFixed(1) : "—";
           const thinkNote = result.thinking.length > 0 ? `, thinking=${result.thinking.length}c` : "";
           log(
             `${tag} sid=${shortSid(sid)}   ← reply (${result.reply.length} chars, ` +

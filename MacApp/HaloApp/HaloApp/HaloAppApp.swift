@@ -83,9 +83,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             let h = try await RuntimeClient.shared.health()
             let next = RuntimeStatus(
-                connected:   true,
-                modelLabel:  h.model,
-                contextHint: h.contextLimit.map { "\($0/1024)K ctx" }
+                connected:    true,
+                modelLabel:   h.model,
+                contextHint:  h.contextLimit.map { "\($0/1024)K ctx" },
+                contextLimit: h.contextLimit,
+                sizeBytes:    h.sizeBytes,
+                tokensPerSec: h.tokensPerSec,
+                quantization: h.quantization,
+                paramsString: h.paramsString
             )
             if AppState.shared.runtimeStatus != next {
                 AppState.shared.runtimeStatus = next

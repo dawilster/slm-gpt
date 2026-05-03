@@ -31,17 +31,37 @@ struct DockStatusStrip: View {
     }
     var mode: Mode
 
+    @Environment(\.runtimeStatus) private var runtimeStatus
+
+    /// "· 8K ctx · 42 tok/s" — composed from whichever live values the
+    /// runtime probe has reported. Empty string when neither is known.
+    private var modelMetaSuffix: String {
+        var bits: [String] = []
+        if let ctx = runtimeStatus.contextLabel { bits.append("\(ctx) ctx") }
+        if let tps = runtimeStatus.tpsNumber    { bits.append("\(tps) tok/s") }
+        return bits.isEmpty ? "" : "· " + bits.joined(separator: " · ")
+    }
+
+    /// Fallback "thinking" right-hand text when no per-step hint was
+    /// provided. Shows recent rolling tok/s when we have it.
+    private var defaultThinkingHint: String {
+        if let tps = runtimeStatus.tpsNumber { return "· generating · \(tps) tok/s" }
+        return "· generating"
+    }
+
     var body: some View {
         HStack(spacing: 10) {
             switch mode {
             case .ready:
-                StatusDot(color: .haloAccent)
-                Text("Ready").foregroundStyle(Color.haloFg)
+                StatusDot(color: runtimeStatus.connected ? .haloAccent : Color.haloFgFaint)
+                Text(runtimeStatus.connected ? "Ready" : "Offline").foregroundStyle(Color.haloFg)
                 VRule()
-                Text("llama-3.3-8b-q4")
+                Text(runtimeStatus.modelLabel)
                     .font(.haloMono(11)).foregroundStyle(Color.haloFgDim)
-                Text("· 8K ctx · 42 tok/s")
-                    .font(.haloMono(10.5)).foregroundStyle(Color.haloFgFaint)
+                if !modelMetaSuffix.isEmpty {
+                    Text(modelMetaSuffix)
+                        .font(.haloMono(10.5)).foregroundStyle(Color.haloFgFaint)
+                }
                 Spacer(minLength: 0)
                 PrivacyPill()
 
@@ -49,9 +69,9 @@ struct DockStatusStrip: View {
                 StatusDot(color: .haloRunning)
                 Text("Thinking").foregroundStyle(Color.haloFg)
                 VRule()
-                Text("llama-3.3-8b-q4")
+                Text(runtimeStatus.modelLabel)
                     .font(.haloMono(11)).foregroundStyle(Color.haloFgDim)
-                Text(hint ?? "· generating · 38 tok/s")
+                Text(hint ?? defaultThinkingHint)
                     .font(.haloMono(10.5)).foregroundStyle(Color.haloFgFaint)
                 Spacer(minLength: 0)
                 Text("esc to stop")
