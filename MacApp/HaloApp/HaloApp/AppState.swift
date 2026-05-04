@@ -55,6 +55,12 @@ final class AppState {
     /// and is it healthy from a process-management perspective?"
     var runtimeProcessState: RuntimeProcessState = .notStarted
 
+    /// Lifecycle of the bundled llama-server child process. Distinct
+    /// from `runtimeProcessState` (which tracks halo-runtime). Only
+    /// meaningful in bundled mode — external mode leaves this at
+    /// `.notStarted`.
+    var modelServerState: ModelServerState = .notStarted
+
     /// Where the brain points for inference. Today only `external` is
     /// functional; `bundled` becomes live when v8.5 ships llama-server.
     /// Persisted to UserDefaults; mutating fires `onEndpointChange` so

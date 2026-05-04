@@ -327,7 +327,7 @@ private struct CatalogModelRow: View {
                 .background(Color.white.opacity(0.05))
                 .clipShape(Capsule())
         case .available:
-            Button(action: { ModelCatalog.shared.startDownload(for: entry.id) }) {
+            Button(action: { startDownloadWithDiskCheck(entry) }) {
                 Text("Download")
                     .font(.haloUI(11, weight: .medium))
                     .foregroundStyle(Color.haloAccent)
@@ -364,7 +364,7 @@ private struct CatalogModelRow: View {
                     Text("Installed").font(.haloUI(10.5))
                 }
                 .foregroundStyle(Color.haloFgDim)
-                Button(action: { ModelCatalog.shared.cancelOrDelete(entry.id) }) {
+                Button(action: { confirmDelete(entry) }) {
                     Text("Delete")
                         .font(.haloUI(10.5))
                         .foregroundStyle(Color.haloWarn)
@@ -403,6 +403,44 @@ private struct CatalogModelRow: View {
         let bytesLeft = Int64(Double(entry.model.sizeBytes) * (1.0 - progress))
         let mb = Double(bytesLeft) / 1_000_000
         return String(format: "%.0f MB left", mb)
+    }
+
+    /// Pre-flight disk check before kicking off a multi-GB download.
+    /// Catches the "downloading 4.6GB onto a near-full disk" case where
+    /// the download fails halfway with an unhelpful "out of space" error.
+    /// Need: model size + 1GB working buffer.
+    private func startDownloadWithDiskCheck(_ entry: ModelEntry) {
+        let needGB = Int(ceil(Double(entry.model.sizeBytes) / 1_000_000_000)) + 1
+        let freeGB = SystemInfo.freeDiskGB()
+        if freeGB < needGB {
+            let alert = NSAlert()
+            alert.messageText = "Not enough disk space"
+            alert.informativeText = "\(entry.model.name) needs about \(needGB) GB, but only \(freeGB) GB is free. Free some space and try again."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+        ModelCatalog.shared.startDownload(for: entry.id)
+    }
+
+    private func confirmDelete(_ entry: ModelEntry) {
+        let alert = NSAlert()
+        alert.messageText = "Delete \(entry.model.name)?"
+        let sizeGB = Double(entry.model.sizeBytes) / 1_000_000_000
+        alert.informativeText = "Frees \(String(format: "%.1f GB", sizeGB)) of disk. You'll need to download it again to use it."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        // First button defaults to .return; mark Delete as destructive
+        // so it picks up the right tint and Cancel as the safe default.
+        if alert.buttons.count >= 2 {
+            alert.buttons[0].hasDestructiveAction = true
+            alert.buttons[1].keyEquivalent = "\u{1b}"  // ESC
+        }
+        if alert.runModal() == .alertFirstButtonReturn {
+            ModelCatalog.shared.cancelOrDelete(entry.id)
+        }
     }
 }
 
@@ -511,12 +549,49 @@ private struct EndpointCard: View {
                 .frame(maxWidth: 420, alignment: .leading)
         } else {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Active model")
-                    .font(.haloUI(11, weight: .medium))
-                    .foregroundStyle(Color.haloFgDim)
+                HStack(spacing: 8) {
+                    Text("Active model")
+                        .font(.haloUI(11, weight: .medium))
+                        .foregroundStyle(Color.haloFgDim)
+                    Spacer(minLength: 0)
+                    modelServerStatusPill
+                }
                 BundledModelPicker(installed: installed)
             }
         }
+    }
+
+    /// Pill showing live llama-server status. Empty in steady-state
+    /// (when running) so we don't add chrome to the most common case.
+    @ViewBuilder
+    private var modelServerStatusPill: some View {
+        switch state.modelServerState {
+        case .starting(let id):
+            HStack(spacing: 5) {
+                ProgressView().controlSize(.mini)
+                Text("Loading \(shortName(for: id))…")
+            }
+            .font(.haloUI(10.5))
+            .foregroundStyle(Color.haloAccent)
+        case .crashed(let reason):
+            HStack(spacing: 5) {
+                Circle().fill(Color.haloWarn).frame(width: 5, height: 5)
+                Text(reason).lineLimit(1).truncationMode(.tail)
+            }
+            .font(.haloUI(10.5))
+            .foregroundStyle(Color.haloWarn)
+        case .running, .stopped, .notStarted:
+            EmptyView()
+        }
+    }
+
+    /// Strip everything before the last `·` and the quant suffix —
+    /// "qwen2.5-1.5b-instruct-q4km" becomes "1.5b". Best-effort.
+    private func shortName(for id: String) -> String {
+        if let m = id.range(of: "[0-9]+\\.[0-9]+b|[0-9]+b", options: .regularExpression) {
+            return String(id[m])
+        }
+        return id
     }
 
     private func applyURL() {
@@ -537,13 +612,21 @@ private struct BundledModelPicker: View {
     let installed: [ModelEntry]
     @Environment(AppState.self) private var state
 
+    private var isSwapping: Bool {
+        if case .starting = state.modelServerState { return true }
+        return false
+    }
+
     var body: some View {
         @Bindable var state = state
         VStack(spacing: 4) {
             ForEach(installed) { entry in
                 let isSelected = (state.selectedModelId ?? installed.first?.id) == entry.id
                 Button(action: {
-                    state.selectedModelId = entry.id
+                    guard !isSwapping else { return }
+                    if state.selectedModelId != entry.id {
+                        state.selectedModelId = entry.id
+                    }
                 }) {
                     HStack(spacing: 10) {
                         ZStack {
@@ -566,8 +649,10 @@ private struct BundledModelPicker: View {
                         RoundedRectangle(cornerRadius: 6)
                             .fill(isSelected ? Color.haloAccent.opacity(0.08) : .clear)
                     )
+                    .opacity(isSwapping && !isSelected ? 0.4 : 1)
                 }
                 .buttonStyle(.plain)
+                .disabled(isSwapping)
             }
         }
     }

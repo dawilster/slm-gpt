@@ -60,6 +60,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         AppState.shared.runtimeProcessState = RuntimeServer.shared.state
 
+        ModelServer.shared.onStateChange = { newState in
+            AppState.shared.modelServerState = newState
+        }
+        AppState.shared.modelServerState = ModelServer.shared.state
+
         // Boot the orchestrated stack: in bundled mode we start the
         // llama-server first and wait for it to come up, *then* the
         // harness, so the harness's first request has a real model

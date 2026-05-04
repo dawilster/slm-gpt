@@ -124,14 +124,17 @@ final class ModelServer {
 
         let p = Process()
         p.executableURL = binary
-        // Reasonable defaults. Context size is a deliberate floor —
-        // we'll surface this as a load-time setting in v8.5+ once the
-        // load-time-vs-request-time settings split lands.
+        // Context size comes from the catalog (32K is typical for Qwen3
+        // family). KV cache cost: roughly 0.5MB/token at f16, so a 32K
+        // context budget is ~16GB of headroom — fine on M-series with
+        // mmap'd weights but we cap at 8K on 8GB Macs to leave room for
+        // user apps. Surfaces as a load-time setting in v8.5+.
+        let contextLimit = ramAdjustedContext(for: entry.model)
         p.arguments = [
             "--model", entry.installedURL.path,
             "--port", String(port),
             "--host", "127.0.0.1",
-            "--ctx-size", "4096",
+            "--ctx-size", String(contextLimit),
             "--n-gpu-layers", "999",  // offload everything to Metal — fastest on Apple Silicon
             "--alias", entry.id,       // shows up as the OpenAI model name
             "--log-prefix",            // colorless line prefixes, cleaner in our log file
@@ -240,6 +243,23 @@ final class ModelServer {
         }
     }
 
+    /// Conservative context budget — the catalog's nominal context vs
+    /// what's safe given the host's RAM. KV cache scales linearly with
+    /// context, and on an 8GB Mac with a 4B model loaded we have very
+    /// little headroom for it. Mirrors design.md §3.5 strategy #2
+    /// (adaptive context budget).
+    private func ramAdjustedContext(for model: CatalogModel) -> Int {
+        let nominal = max(2048, model.context)
+        // Floor based on RAM tier. 8GB → 8K cap, 16GB → 16K, 24GB+ → no cap.
+        let cap: Int
+        switch SystemInfo.totalRAMGB {
+        case ..<12:  cap = 8192
+        case 12..<20: cap = 16384
+        default:     cap = nominal
+        }
+        return min(nominal, cap)
+    }
+
     private func locateBinary() -> URL? {
         // We invoke the *supervisor* shell wrapper, not llama-server
         // directly — the wrapper handles parent-pid death-pact and
@@ -284,8 +304,14 @@ final class ModelServer {
         return nil
     }
 
+    /// True only when llama-server is fully loaded and ready to accept
+    /// inference. /health returns 503 + "Loading model" while the GGUF
+    /// is mmap'ing (~1-10s depending on model size), then 200 + "ok".
+    /// /v1/models would 200 as soon as the server binds the port — too
+    /// lenient for our boot-order: halo-runtime would race the model
+    /// load and its first discovery probe would hit 503.
     private func healthOK() async -> Bool {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/v1/models") else { return false }
+        guard let url = URL(string: "http://127.0.0.1:\(port)/health") else { return false }
         var req = URLRequest(url: url)
         req.timeoutInterval = 1.0
         let session = URLSession(configuration: .ephemeral)
