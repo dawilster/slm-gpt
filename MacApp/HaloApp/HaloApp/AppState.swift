@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum HaloMenubarState: String, Equatable {
-    case idle, listening, thinking, loading
+    case offline, idle, listening, thinking, loading
 }
 
 enum DockScreen: String, CaseIterable, Identifiable {

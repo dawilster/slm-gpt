@@ -253,9 +253,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension HaloMark {
     @MainActor
-    static func menubarImage(state: HaloMenubarState) -> NSImage {
+    static func menubarImage(state: HaloMenubarState, phaseDegrees: Double = 0) -> NSImage {
         let renderer = ImageRenderer(content:
-            HaloMark(size: 18, state: state, color: .white)
+            HaloMark(size: 18, state: state, color: .white, phaseDegrees: phaseDegrees)
                 .frame(width: 18, height: 18)
         )
         renderer.scale = NSScreen.main?.backingScaleFactor ?? 2.0

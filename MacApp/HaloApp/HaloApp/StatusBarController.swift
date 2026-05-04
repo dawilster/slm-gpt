@@ -18,6 +18,13 @@ final class StatusBarController: NSObject, NSWindowDelegate {
     private let statusItem: NSStatusItem
     private let panel: StatusPanel
     private let host: NSHostingView<AnyView>
+    private let state: AppState
+
+    /// Drives the rotating-arc animation for `.thinking` / `.loading` —
+    /// SwiftUI's `repeatForever` doesn't survive `ImageRenderer`, so we
+    /// re-rasterize the glyph ourselves at ~10Hz with an advancing phase.
+    private var animationTimer: Timer?
+    private var animationStart: Date?
 
     private let onSummon:      () -> Void
     private let onSettings:    () -> Void
@@ -33,6 +40,7 @@ final class StatusBarController: NSObject, NSWindowDelegate {
         onCycleDock:   @escaping () -> Void,
         onOpenSession: @escaping (String) -> Void
     ) {
+        self.state         = state
         self.onSummon      = onSummon
         self.onSettings    = onSettings
         self.onRunSetup    = onRunSetup
@@ -107,8 +115,12 @@ final class StatusBarController: NSObject, NSWindowDelegate {
             button.action = #selector(handleClick(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
-        refreshIcon(menubar: state.menubarState)
-        observe(state: state)
+        refreshIcon()
+        observe()
+    }
+
+    deinit {
+        animationTimer?.invalidate()
     }
 
     // MARK: - Click dispatch
@@ -203,21 +215,72 @@ final class StatusBarController: NSObject, NSWindowDelegate {
 
     // MARK: - Icon
 
-    private func refreshIcon(menubar: HaloMenubarState) {
-        statusItem.button?.image = HaloMark.menubarImage(state: menubar)
+    /// Combine connectivity, chat status, and explicit menubar state into a
+    /// single glyph state. Offline trumps everything else — the runtime
+    /// being down is the most important fact at a glance — followed by an
+    /// in-flight chat turn, then any caller-set state.
+    private var derivedState: HaloMenubarState {
+        if !state.runtimeStatus.connected { return .offline }
+        if state.chat.status == .thinking { return .thinking }
+        return state.menubarState
     }
 
-    /// Re-render the menubar glyph whenever AppState.menubarState changes.
-    /// `withObservationTracking` only fires once per registration, so we
-    /// re-arm after each callback.
-    private func observe(state: AppState) {
+    /// Period (seconds) for one full rotation of the dashed arc.
+    private static let thinkingPeriod: TimeInterval = 2.4
+    private static let loadingPeriod:  TimeInterval = 1.2
+
+    private func refreshIcon() {
+        let s = derivedState
+        let phase: Double = {
+            guard let start = animationStart else { return 0 }
+            let elapsed = Date().timeIntervalSince(start)
+            switch s {
+            case .thinking:
+                return elapsed.truncatingRemainder(dividingBy: Self.thinkingPeriod)
+                    / Self.thinkingPeriod * 360
+            case .loading:
+                return elapsed.truncatingRemainder(dividingBy: Self.loadingPeriod)
+                    / Self.loadingPeriod * 360
+            default:
+                return 0
+            }
+        }()
+        statusItem.button?.image = HaloMark.menubarImage(state: s, phaseDegrees: phase)
+        syncAnimationTimer(for: s)
+    }
+
+    private func syncAnimationTimer(for s: HaloMenubarState) {
+        let needsAnim = (s == .thinking || s == .loading)
+        if needsAnim, animationTimer == nil {
+            animationStart = Date()
+            // ~10 fps. Tolerance lets the runloop coalesce ticks when the
+            // app is otherwise idle, so we're not pinning the CPU.
+            let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.refreshIcon() }
+            }
+            t.tolerance = 0.02
+            RunLoop.main.add(t, forMode: .common)
+            animationTimer = t
+        } else if !needsAnim, animationTimer != nil {
+            animationTimer?.invalidate()
+            animationTimer = nil
+            animationStart = nil
+        }
+    }
+
+    /// Re-render the glyph whenever the menubar state OR the runtime
+    /// connectivity changes. `withObservationTracking` only fires once per
+    /// registration, so we re-arm after each callback.
+    private func observe() {
         withObservationTracking {
             _ = state.menubarState
+            _ = state.runtimeStatus
+            _ = state.chat.status
         } onChange: { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
-                self.refreshIcon(menubar: state.menubarState)
-                self.observe(state: state)
+                self.refreshIcon()
+                self.observe()
             }
         }
     }
