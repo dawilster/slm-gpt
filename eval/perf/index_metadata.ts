@@ -9,7 +9,7 @@
  * Doesn't need a model server: a stub embedder returns deterministic
  * vectors so we can assert exactly which chunks search() returns.
  *
- * Run with:  bun run eval/index_metadata.ts
+ * Run with:  bun run eval/perf/index_metadata.ts
  * Exit 0 if all checks pass.
  */
 
@@ -17,9 +17,9 @@ import { mkdir, rm, writeFile, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { IndexStore } from "../src/index_store";
-import { indexAll } from "../src/indexer";
-import { chunkMarkdown } from "../src/chunker";
+import { IndexStore } from "../../src/index_store";
+import { indexAll } from "../../src/indexer";
+import { chunkMarkdown } from "../../src/chunker";
 
 const TEST_ROOT = join(tmpdir(), `assistant-index-meta-${process.pid}-${Date.now()}`);
 const NOTES_ROOT = join(TEST_ROOT, "notes");

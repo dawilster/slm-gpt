@@ -207,13 +207,13 @@ bun run src/index.ts --load <id-prefix>  # load a specific session
 /quit /clear /new /history /tokens /context /budget [n]
 /sessions /load <id> /resume /tools
 
-# evals:
-bun run eval/v0.ts   # substrate (latency, statelessness, token growth)
-bun run eval/v1.ts   # context management
-bun run eval/v2.ts   # persistence (kill → reload → recall)
-bun run eval/v3.ts   # tool calling (registry, dispatch, agent loop)
-bun run eval/v4.ts   # multi-tool routing (5 tools, selection + arg validity)
-bun run eval/v5.ts   # profile (write, recall, supersession)
+# evals (organised by capability, not version):
+bun run eval/run.ts                    # all suites — exits 0 if every gated check passes
+bun run eval/run.ts substrate          # one suite by name (prefix match)
+bun run eval/run.ts --offline          # skip anything that hits the model
+
+# suites: substrate, context, persistence, profile, tool_loop, rag, shortcuts
+# perf benchmarks (not pass/fail): bun run eval/perf/perf_gen.ts etc.
 ```
 
 Notes folder: `~/.assistant/notes/*.md` — drop markdown files there and the assistant can `read_note` them. Sessions live at `~/.assistant/sessions/`.

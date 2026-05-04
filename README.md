@@ -50,7 +50,7 @@ One concept per version. We don't advance until the previous one is felt.
 | v9 | Background daemon, scheduling, notifications | future |
 | v10+ | Channel adapters (iMessage, Slack, …) | future |
 
-Per-version pass conditions and evals live in `eval/v*.ts` and `design.md` §6.
+Capability-level pass conditions and evals live in `eval/suites/*.ts` and `design.md` §6. Run with `bun run eval/run.ts` (or `bun run eval/run.ts <suite>` for one; `--offline` to skip model-driven checks).
 
 ---
 
