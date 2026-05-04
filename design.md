@@ -177,6 +177,51 @@ That's a fixed +2 surface regardless of how big the user's library is.
 
 **Tool-count tradeoff.** v4 shipped at 8 tools with a clean 30/30. v6.5 takes us to 10 — right at the §5 "8+" cliff. We accept that and watch the v4 regression suite for tool-selection drift. If it shows up, the weakest carrier in the existing set (`search_notes_by_filename` — semantically overlapping with `search_corpus`) is the natural drop candidate.
 
+### 3.8 Inference orchestration (bundled model + power-user override)
+
+Today the user installs LM Studio themselves, picks a model, hits "load", and the harness happens to find an OpenAI-compat endpoint at `localhost:1234`. That's a respectable developer setup — but it's a wall a non-technical user will not climb. The §1 vision ("the smallest assistant I'd actually use daily") implies *I* would use it, which I will, but it also implies it could be handed to someone who has never heard of MLX. That handoff is what this section addresses.
+
+**Architectural framing.** The Mac app is the process orchestrator. The harness (`src/server.ts`) is its brain. Inference is just another spawn alongside the harness — same `RuntimeServer`-style lifecycle, same parent-pid death-pact, same Resources-bundled binary, same probe-then-attach pattern. The contract that makes this clean is the one already locked in: the harness reads `MODEL_BASE_URL` from env. The Mac app sets it. The harness doesn't know — and must never know — whether the URL points at our bundled `llama-server`, the user's LM Studio, an `mlx_lm.server` they spun up, or a hosted API.
+
+```
+HaloApp.app  (process orchestrator)
+  ├─ spawns halo-runtime   (Bun harness — the brain)
+  │     ↓ MODEL_BASE_URL injected at spawn
+  └─ spawns llama-server   (inference, bundled in Resources/)
+        :1235/v1
+```
+
+**Three user tiers, one architecture:**
+
+| Tier | What they do | What the app does |
+|---|---|---|
+| **Default** | Picks a model from a curated dropdown, accepts download | Spawns bundled `llama-server` pointed at the chosen GGUF; sets `MODEL_BASE_URL=http://localhost:1235/v1` for the harness |
+| **Power user** | Toggles "use my own endpoint", pastes a URL | Skips spawning `llama-server`; sets `MODEL_BASE_URL` to whatever they pasted |
+| **Tweaker** | Adjusts temperature, ctx size, etc. in Settings | Per-request params go into the chat call; load-time params trigger a `llama-server` restart |
+
+The harness sees one wire protocol. Routing (v8) extends this same pattern to mid/frontier — `MODEL_BASE_URL_MID`, `MODEL_BASE_URL_FRONTIER`. The orchestrator pattern compounds.
+
+**Why `llama.cpp` and not MLX.** llama-server is one statically-linked Mach-O (~6MB), Metal backend on Apple Silicon, OpenAI-compat HTTP out of the box, code-signs cleanly with hardened runtime, ships as a Resource via the same Xcode build phase as `halo-runtime`. The MLX route is faster (your `eval/perf/perf_gen.ts` measured ~25 tok/s direct vs ~20 in LM Studio) but mlx-swift is younger, the model ecosystem narrower (`mlx-community` is the canonical HF org), and Apple-Silicon-only. llama.cpp Metal is "good enough at 8GB" and gives Intel a fallback that costs nothing. We trade peak tok/s for portability and ecosystem maturity. Revisit if Apple Silicon goes to >50% of users *and* MLX bindings stabilize.
+
+**Curated catalog, not a free-for-all.** A JSON manifest shipped in the app bundle. ~3-5 entries, one quant per. Each entry is `{name, params, quant, size_mb, ram_required_mb, context, url, sha256, min_ram_gb}`. The "vetting" is honest: we picked it, we tested it works on our reference hardware, we pinned the SHA256 so a HF account compromise can't push poisoned weights to our users. It is *not* a claim about the safety of the model's outputs — write that down so future-William doesn't oversell it. New models = new app release. Cadence-driven server-side manifest is the obvious follow-up; not yet.
+
+**RAM gating is a UI affordance, not a hope.** On the 8GB M1 baseline, anything 7B+ is unsafe. The catalog entries carry `min_ram_gb`; the picker disables (and explains) entries the user's machine can't host. The pre-flight resource check from §3.5 strategy #1 is what answers "is now the right time to load this?" — RAM gating is the static version of the same idea.
+
+**The hard part is first-launch UX, not the engineering.** A 2.4GB download over a flaky home connection is 5+ minutes of "downloading model…" before the first reply. That is brutal for a non-technical user. Three mitigations, layered in order of payoff:
+
+1. **Smaller default.** Ship the smallest viable Qwen variant (~900MB) as the day-one pick. Bigger models become explicit upgrades. 90 seconds vs 5 minutes is a different product.
+2. **Progressive disclosure.** The user can use the app immediately — settings, onboarding, even a placeholder chat — while the download runs in the background. Notify when ready.
+3. **Cloud fallback during download** (requires v8 routing). First-message-while-downloading routes to the mid tier. The user never sees a blocked state. This is the strongest argument for sequencing v8.5 *after* v8.
+
+**Storage and lifecycle:**
+
+- Models live at `~/Library/Application Support/HaloApp/models/<model-id>/`. Outside the app bundle (immutable + signed). Outside `~/.assistant/` (user state — separation of concerns).
+- Downloads use HTTP range requests (HF supports them). Resume on flaky-wifi drops; verify SHA256 on completion before accepting.
+- "Delete this model" is a non-negotiable Settings affordance. 8GB-disk users will need it.
+- Model swap = stop `llama-server`, change `--model <path>`, respawn, wait for `:1235/v1/models` to respond. The harness reconnects on its next request — no harness restart needed.
+
+**Settings: load-time vs request-time params.** A real trap. Some params are per-request (temperature, top_p, max_tokens, stop) — set in the chat call, no reload, instant. Some are load-time (context size, KV-cache quant, GPU layers) — require respawning `llama-server`. The Settings UI must mark load-time params with a "requires reload (~3s)" badge or users will toggle context size and wonder why nothing changed. Same point as the §3.5 KV-cache observation: shipping our own builds means we don't inherit LM Studio's broken quant path on this version of MLX (decision log 2026-04-29).
+
 ## 4. The Trajectory
 
 Each version introduces exactly one new mental model. We do not advance until the previous one is felt.
@@ -193,6 +238,7 @@ Each version introduces exactly one new mental model. We do not advance until th
 | **v6.5** | future | System bridge (Apple Shortcuts) | `list_shortcuts` + `run_shortcut(name, input?)` over the macOS `shortcuts` CLI; fuzzy-match on unknown names; `GET /v1/shortcuts` for the Mac app | The runtime can reach *out* of the laptop via the user's existing Shortcuts library, without a tool-per-shortcut blowup |
 | **v7** | future | Web search | External tool, fetch + parse + summarize | Live data, source citation, latency |
 | **v8** | future | Model routing | Add a second tier (mid or frontier), `ModelClient` abstraction, routing policy, cost/latency logs | When to escalate, what the privacy boundary buys, the cost/quality/latency triangle |
+| **v8.5** | future | Bundled inference + curated catalog (§3.8) | `llama-server` bundled in the Mac app via the same Resources/build-phase pattern as `halo-runtime`; JSON manifest of 3-5 vetted models with pinned SHA256s; downloader UI with resume + integrity check; RAM-gated picker; load-time vs request-time settings split; power-user "use my own endpoint" override | Process orchestration generalises (the Mac app already owns the harness — inference is the second instance of the pattern); the model-management UX (catalog, download, swap, delete) is the actual product surface; first-launch UX is the hardest part and is why v8 routing comes first (cloud fallback during download) |
 | **v9** | future | Scheduling / background | Cron-style triggers, notifications, persistent agent loop | The assistant runs even when I'm not looking |
 | **v10+** | future | Channels | Adapters for iMessage, Slack, etc. | The OpenClaw shape |
 
@@ -286,6 +332,7 @@ Each version ships with a defined "done" — concrete, measurable, automatable.
 | v6.5 | Shortcuts test set: 15 prompts (single run, two-step chain, unknown-name graceful, three-step chain). ≥ 12 produce the right `run_shortcut` call(s) with reasonable args; 100% of unknown-name cases return a fuzzy-match suggestion rather than a generic failure; v4 regression suite still ≥ 28/30 (no tool-selection drift). |
 | v7 | Web-search test set: 20 current-events questions, ≥ 14 produce a sourced, accurate answer |
 | v8 | Routing test set: 40 prompts hand-labeled with the correct tier; router picks correctly ≥ 32. Privacy regex is respected on 100% of synthetic sensitive prompts (zero leaks). Cost log is accurate to within 5%. |
+| v8.5 | First-launch UX: clean install on a fresh-state machine reaches a working chat reply in under 3 minutes on a baseline home connection (~50Mbps) with the smallest catalog model. Download resume survives a forced network drop at 50% (resumes, doesn't restart from zero). SHA256 mismatch on a corrupted file is caught and surfaced. Model swap from picker → first reply on the new model in < 10s. RAM gating: 7B+ entries are disabled and explained on an 8GB machine. Power-user override (point at LM Studio at :1234) works without touching any other setting. Existing v6.5 + v4 regression suites still pass on the bundled `llama-server` build (no regression vs LM Studio baseline). |
 | v9 | Scheduled task fires on time, completes, and notifies; no zombie processes after restart |
 
 ### 6.2 Frontier-as-judge
@@ -392,6 +439,10 @@ Things we don't know yet, and intend to learn:
 19. **Daemon-vs-REPL coordination primitive (§3.6):** file lock? Unix socket? A row in a shared SQLite? The simplest thing that survives crashes and doesn't require the user to manually clear stale state wins.
 20. **Notification taxonomy (§3.6):** is two tiers enough (informational vs urgent), or do we need finer grain — and how does the user define which is which without becoming an admin? Inversion candidate: classify-on-emit ("this is the first thing that matched the rule, so it's urgent; the next twenty are noise"), not classify-on-rule.
 21. **Shortcut metadata layer (v6.5 follow-up):** v6.5 ships the action surface (run_shortcut + name list inlined into the prompt), but the agent-facing contract is genuinely thin — opaque string names, no schema, no intent tag. The eval surfaced that without metadata the model has to disambiguate purely from name string + user phrasing, which is fragile and pushed us toward library-specific prompt examples (rejected — see §8). The architectural answer is `~/.assistant/shortcut-meta.json` keyed on shortcut name, with fields like `intent` (enum: `create_note`, `start_timer`, etc.), `is_default_for` (intent), and possibly `expects_input` (bool). Generation: local LLM classifies new names on first sight (one-shot, ~5 tokens out, runs at most a handful of times across the user's lifetime). User overrides via UI. Refresh cadence: diff-and-fill on every shortcut cache refresh — almost never runs in practice. Open empirical question: how much of the model's failure modes does this actually fix vs how much is intrinsic to 4B routing? Answer when v6.5 ships its non-hardcoded baseline eval.
+22. **Catalog cadence (v8.5):** ship the manifest in the app bundle (new model = app release) or fetch from a server we operate (faster cadence, now we have a server)? Default: in-bundle, until the cadence of new SLM releases makes that visibly limiting. Trigger to revisit: a model lands that we want users on within a week and an app-update would take longer.
+23. **llama.cpp version pinning (v8.5):** llama.cpp moves fast and breaking changes in the GGUF format (or the Metal backend) are not unheard-of. Do we pin to a specific upstream tag and update deliberately, or chase main? Hypothesis: pin and update on a per-app-release cadence, with a regression suite (v4 multi-tool + v6 RAG + v6.5 shortcuts) that has to pass on the new build before we ship.
+24. **First-launch UX measurement (v8.5):** the §6.1 v8.5 pass condition says "under 3 minutes" — what's the actual measurement methodology? Reset-VM-style fresh install is the cleanest but expensive to automate. Manual stopwatch on each app release is realistic and probably good enough.
+25. **Inference backend swap-out (v8.5+):** the §3.8 framing assumes the architecture lets us swap llama-server → mlx-server (or anything else) without changing the harness. That's true *in principle* (the harness only knows `MODEL_BASE_URL`), but tool-calling JSON quirks differ between backends — what passes the v4 suite on llama-server might fail on mlx-server. Open question: how much regression-suite delta do we tolerate before declaring "the contract isn't tight enough"? Layered fix candidate: a thin `ModelClient`-level adapter (already on the v8 roadmap) that normalizes the differences.
 
 ## 8. Decision log
 
@@ -433,6 +484,8 @@ Architectural choices, with reasons. So future-William remembers why.
 | 2026-05-01 | Dropped note-file CRUD tools (`read_note`, `list_notes`, `write_note`, `search_notes_by_filename`); note actions now route through Shortcuts | The user owns their notes ergonomics in Apple Notes (or whatever the "New Note" shortcut writes to), and that's where their existing reading/editing/search workflow lives. A second markdown-file CRUD surface inside the agent was always a parallel store the user had to remember to use. Cleanest is one write path: Shortcuts. Side effects: tool count drops from 10 → 6 (well below the §5 "8+" cliff — easier tool selection, less to mis-select); `~/.assistant/notes/` becomes import-only for `search_corpus` (RAG) — drop markdown there if you want it indexed; v4 multi-tool eval is now over a different toolset, so not directly comparable for regression checks. **Open seam:** notes the agent creates via the "New Note" shortcut land in Apple Notes' store, while `search_corpus` only sees `~/.assistant/notes/`. The agent can write but won't recall what it wrote — bridge candidates: (a) point the shortcut at a markdown file, (b) Apple Notes → markdown sync, (c) accept that "create a note" and "find a note" speak to different stores and document it. Defer until usage shows which way the user actually flows. |
 | 2026-05-01 | v6.5 eval iteration: BASE_SYSTEM grew 109% via library-specific examples (362 → 758 tokens). Reverted; durable rule against this approach. | Five eval iterations chasing failure modes ended up encoding specific user-library values ("Create Note with Date", "Add to Bear Note") and specific user phrasings ("save a note", "remind me to take out the trash") as anti-examples in the prompt. Three problems: brittle (renaming the user's shortcuts breaks the examples), bloats every request (now-stable prefix, but eats budget), doesn't generalize across users. Pivoting to: solve in runtime / UI / data, not in the prompt. The 4B failure-mode catalog (§5.1) lists each mode with its non-prompt mitigation. The system prompt's job is high-level routing; runtime catches the failure shapes; UI gives the user agency. **Captured as a durable feedback memory** so future-Claude doesn't re-run the same hill. |
 | 2026-05-01 | Adopt shortcut-meta.json as the typed contract layer over Shortcuts (replaces hardcoded prompt examples) | Shortcuts as a user-facing primitive is right (user-authored, macOS-integrated, zero engineering overhead). The agent-facing contract — opaque name strings — is wrong; without intent metadata the model has to disambiguate from name + user phrasing, which fails at 4B. `~/.assistant/shortcut-meta.json` keyed on shortcut name with fields {intent (enum), is_default_for, classified_by, classified_at}. Local LLM classifies new names on first sight (one-shot, ~5 tokens out). Diff-and-fill runs on every shortcut cache refresh — almost never fires in practice. Defaults are picked programmatically (first-seen of an intent), not asked of the model — sidesteps the three-step ask-save-act flow that broke at 4B (§5.1). The model picks shortcuts by intent matching, not name string matching. New users tag their shortcuts via UI once; reliability follows from the data, not the prompt. |
+| 2026-05-05 | The Mac app spawns + owns the harness lifecycle; sandbox dropped, hardened runtime kept | Pre-shipped state required the user to run `bun run src/server.ts` in a terminal alongside the Mac app — fine for me, a wall for anyone else. HaloApp now spawns the bundled `halo-runtime` (Bun, `bun build --compile`) at launch, terminates it at quit, and survives force-kill via a parent-pid death-pact in `src/server.ts`. Sandbox is off because the harness needs `~/.assistant/`, the `shortcuts` CLI, and `localhost:1234` — keeping it on would mean per-capability entitlement negotiations forever. Hardened runtime stays for distribution; `cs.allow-jit` + `cs.disable-library-validation` cover Bun's JIT and the spawned-binary path. Probe-then-attach lets a developer run `bun --hot src/server.ts` themselves with `HALO_NO_SPAWN=1` for TS hot-reload without fighting the app. |
+| 2026-05-05 | Frame the Mac app as the *process orchestrator*, not just a UI shell — establishes the v8.5 inference-bundling design | Once the Mac app spawns `halo-runtime`, bundling `llama-server` is the second instance of the same pattern, not a new architectural concern. The contract that makes this work is `MODEL_BASE_URL` env var passed at spawn time — the harness has never known *who* serves the model and now formally must not. v8.5 ships bundled inference; v8 routing later adds `MODEL_BASE_URL_MID` / `_FRONTIER`; the orchestrator pattern compounds. Power-user mode (point at user's LM Studio) is one if-statement: skip spawning `llama-server`, set `MODEL_BASE_URL` to the pasted URL. Captured in §3.8. |
 
 ## 9. Out of scope (for now)
 
@@ -450,4 +503,4 @@ These are deferred, not rejected. They land when their prerequisite work is in p
 
 ---
 
-*Last updated: 2026-05-01 (v6.5 iteration: 4B empirical-cliffs catalog, shortcut-meta.json architecture, durable rule against prompt-hardcoding). Update at every architectural decision, every learned constraint, every shipped version.*
+*Last updated: 2026-05-05 (Mac app owns the harness lifecycle; §3.8 inference orchestration + v8.5 bundled-llama-server entry). Update at every architectural decision, every learned constraint, every shipped version.*
