@@ -2,9 +2,23 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>com.apple.security.app-sandbox</key>
-	<true/>
+	<!-- App sandbox is intentionally OFF. The app spawns the bundled
+	     `halo-runtime` (Bun) child process which needs free filesystem
+	     access (~/.assistant/), the `shortcuts` CLI, and the LM Studio
+	     OpenAI endpoint at localhost:1234 — all of which are awkward or
+	     impossible inside the sandbox. -->
+
 	<key>com.apple.security.network.client</key>
+	<true/>
+
+	<!-- Hardened runtime stays ON for distribution. These exceptions let
+	     the bundled Bun runtime JIT-compile JS and let us spawn it as a
+	     child without library-validation rejecting it. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<key>com.apple.security.cs.disable-library-validation</key>
 	<true/>
 </dict>
 </plist>

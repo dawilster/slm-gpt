@@ -52,6 +52,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Banner notifications when replies land while the dock is hidden.
         Notifier.shared.bootstrap()
 
+        // Spawn (or attach to) the bundled Bun runtime *before* the health
+        // probe starts — so the very first probe has a real chance of
+        // succeeding instead of flashing "offline" for a beat.
+        RuntimeServer.shared.onStateChange = { newState in
+            AppState.shared.runtimeProcessState = newState
+        }
+        AppState.shared.runtimeProcessState = RuntimeServer.shared.state
+        Task { await RuntimeServer.shared.start() }
+
         // Periodic runtime health probe — drives the "Ready / Offline" status
         // in the dock and the menubar dropdown.
         startHealthProbe()
@@ -106,6 +115,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     static var shared: AppDelegate? {
         NSApp.delegate as? AppDelegate
+    }
+
+    // MARK: Runtime teardown
+
+    /// Tear down the bundled runtime when the app quits. SIGTERM-then-
+    /// SIGKILL with a 3s grace window — see RuntimeServer.stop().
+    func applicationWillTerminate(_ notification: Notification) {
+        RuntimeServer.shared.stop()
     }
 
     // MARK: Hotkey

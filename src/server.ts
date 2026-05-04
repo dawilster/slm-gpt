@@ -64,6 +64,27 @@ const DEFAULT_BUDGET = Number(process.env.CONTEXT_BUDGET ?? 4096);
 const QUIET          = process.env.HALO_LOG_QUIET === "1";
 const THINKING       = process.env.HALO_THINKING === "1";
 
+// Death-pact with the parent (the Mac app). When the runtime is spawned by
+// HaloApp, HALO_PARENT_PID is set to the app's pid. We poll that pid every
+// 2s and exit cleanly if the parent is gone — guards against the parent
+// crashing or being SIGKILLed without a chance to tear us down (in which
+// case the OS reparents us to launchd and we'd otherwise live forever).
+//
+// kill(pid, 0) with signal 0 doesn't actually send a signal — it only
+// checks whether the target exists and we have permission to signal it.
+// ESRCH means "no such process" → parent is gone.
+const PARENT_PID = Number(process.env.HALO_PARENT_PID ?? 0) || null;
+if (PARENT_PID !== null) {
+  setInterval(() => {
+    try {
+      process.kill(PARENT_PID, 0);
+    } catch {
+      console.error(`[halo ${ts()}] parent pid ${PARENT_PID} is gone — exiting`);
+      process.exit(0);
+    }
+  }, 2000).unref();
+}
+
 // ─── Logging ─────────────────────────────────────────────
 
 /** HH:MM:SS.sss — keeps log lines grep-able without taking too much width. */

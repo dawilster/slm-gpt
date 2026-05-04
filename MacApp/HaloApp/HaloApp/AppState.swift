@@ -32,6 +32,12 @@ final class AppState {
     /// Health probe of the local runtime daemon (model, context, online flag).
     var runtimeStatus: RuntimeStatus = .offline
 
+    /// Lifecycle of the bundled runtime child process — distinct from
+    /// `runtimeStatus`, which is just the HTTP health of whatever's
+    /// listening on the port. `processState` answers "did *we* spawn it,
+    /// and is it healthy from a process-management perspective?"
+    var runtimeProcessState: RuntimeProcessState = .notStarted
+
     /// User-bindable hotkey, persisted to UserDefaults. Mutating it
     /// triggers re-registration via `onHotkeyChange`.
     var hotkey: Hotkey {

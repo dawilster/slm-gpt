@@ -4,3 +4,10 @@ node_modules/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Compiled by scripts/build-runtime.sh — bundled into the Mac app at build time.
+/halo-runtime
+
+# Bun build transients
+.*.bun-build
+*.js.map

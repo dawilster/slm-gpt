@@ -55,6 +55,7 @@
 				3DF8491A2FA35C2B0035330F /* Sources */,
 				3DF8491B2FA35C2B0035330F /* Frameworks */,
 				3DF8491C2FA35C2B0035330F /* Resources */,
+				D0E1D0E1D0E1D0E1D0E1D0E1 /* Bundle halo-runtime */,
 			);
 			buildRules = (
 			);
@@ -113,6 +114,29 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		D0E1D0E1D0E1D0E1D0E1D0E1 /* Bundle halo-runtime */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Bundle halo-runtime";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/halo-runtime",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\nREPO=\"$SRCROOT/../..\"\nif [ ! -f \"$REPO/scripts/build-runtime.sh\" ]; then\n  echo \"error: $REPO/scripts/build-runtime.sh not found\" >&2\n  exit 1\nfi\n\"$REPO/scripts/build-runtime.sh\"\nDEST=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\nmkdir -p \"$DEST\"\ncp \"$REPO/halo-runtime\" \"$DEST/halo-runtime\"\nchmod +x \"$DEST/halo-runtime\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		3DF8491A2FA35C2B0035330F /* Sources */ = {
@@ -255,7 +279,7 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = LL635KMB93;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
@@ -289,7 +313,7 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = LL635KMB93;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
