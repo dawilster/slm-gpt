@@ -59,13 +59,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             AppState.shared.runtimeProcessState = newState
         }
         AppState.shared.runtimeProcessState = RuntimeServer.shared.state
-        Task { await RuntimeServer.shared.start() }
 
-        // Restart the runtime when the user toggles endpoint mode in
-        // Settings. URL-field edits are debounced and applied via the
-        // explicit applyEndpointChanges() call below.
+        // Boot the orchestrated stack: in bundled mode we start the
+        // llama-server first and wait for it to come up, *then* the
+        // harness, so the harness's first request has a real model
+        // behind it. In external mode we just spawn the harness and
+        // trust the user's endpoint is reachable.
+        Task { await self.bootInferenceStack() }
+
+        // Endpoint mode change → tear down ModelServer if we left
+        // bundled, spin it up if we entered. Then restart the harness
+        // with the new MODEL_BASE_URL. URL-field edits are debounced
+        // via the explicit applyEndpointChanges() call.
         AppState.shared.onEndpointChange = { [weak self] in
             self?.applyEndpointChanges()
+        }
+
+        // Selected-model change in bundled mode → restart ModelServer
+        // pointed at the new GGUF.
+        AppState.shared.onSelectedModelChange = { [weak self] in
+            self?.applySelectedModelChange()
         }
 
         // Periodic runtime health probe — drives the "Ready / Offline" status
@@ -126,18 +139,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Runtime teardown
 
-    /// Tear down the bundled runtime when the app quits. SIGTERM-then-
-    /// SIGKILL with a 3s grace window — see RuntimeServer.stop().
+    /// Tear down both the bundled runtime and llama-server when the app
+    /// quits. Order matters: harness first (it depends on the model
+    /// server), then llama-server. Each does SIGTERM-then-SIGKILL with
+    /// its own grace window.
     func applicationWillTerminate(_ notification: Notification) {
         RuntimeServer.shared.stop()
+        ModelServer.shared.stop()
     }
 
-    /// Restart the runtime so it picks up new MODEL_BASE_URL from
-    /// AppState. Called by the endpoint settings flow — both the mode
-    /// toggle and the explicit "Apply" button on the URL field route
-    /// here so the Settings UI has one path that does the right thing.
+    // MARK: - Inference stack orchestration
+
+    /// Boot the inference stack in the right order based on current
+    /// endpoint mode. In bundled mode we wait for llama-server's health
+    /// before starting the harness — otherwise the harness's first
+    /// model-discovery probe races the model load and reports offline.
+    private func bootInferenceStack() async {
+        switch AppState.shared.endpointMode {
+        case .bundled:
+            await startBundledModelIfPossible()
+            await RuntimeServer.shared.start()
+        case .external:
+            // No model server to manage — harness talks straight to the
+            // user's endpoint.
+            await RuntimeServer.shared.start()
+        }
+    }
+
+    /// Pick a model and start llama-server. Falls back to first
+    /// installed entry if the user hasn't picked one (a fresh-install
+    /// state: bundled mode selected in onboarding, no explicit pick).
+    /// If nothing is installed, we leave llama-server stopped — the UI
+    /// surfaces the empty state.
+    private func startBundledModelIfPossible() async {
+        let catalog = ModelCatalog.shared
+        let modelId: String? = AppState.shared.selectedModelId
+            ?? catalog.entries.first(where: {
+                if case .installed = $0.availability { return true }
+                return false
+            })?.id
+
+        guard let modelId else {
+            ModelServer.shared.onStateChange?(.crashed(reason: "no installed model"))
+            return
+        }
+        await ModelServer.shared.start(modelId: modelId)
+    }
+
+    /// User flipped the endpoint mode (or hit Apply on a new URL).
+    /// Stop/start the ModelServer to match, then restart the harness
+    /// with the new MODEL_BASE_URL.
     func applyEndpointChanges() {
-        Task { await RuntimeServer.shared.restart() }
+        Task {
+            switch AppState.shared.endpointMode {
+            case .bundled:
+                await startBundledModelIfPossible()
+            case .external:
+                ModelServer.shared.stop()
+            }
+            await RuntimeServer.shared.restart()
+        }
+    }
+
+    /// User picked a different bundled model from Settings. Stop the
+    /// current llama-server, start it with the new model. Harness
+    /// stays up — its next request reconnects automatically since
+    /// MODEL_BASE_URL hasn't changed.
+    func applySelectedModelChange() {
+        guard AppState.shared.endpointMode == .bundled else { return }
+        Task { await self.startBundledModelIfPossible() }
     }
 
     // MARK: Hotkey

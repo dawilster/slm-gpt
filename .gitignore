@@ -8,6 +8,11 @@ __pycache__/
 # Compiled by scripts/build-runtime.sh — bundled into the Mac app at build time.
 /halo-runtime
 
+# Fetched by scripts/build-llama-server.sh — official llama.cpp prebuilt
+# bundled into the Mac app's Resources/llama-runtime/.
+/llama-runtime/
+/vendor/
+
 # Bun build transients
 .*.bun-build
 *.js.map

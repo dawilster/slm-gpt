@@ -56,6 +56,7 @@
 				3DF8491B2FA35C2B0035330F /* Frameworks */,
 				3DF8491C2FA35C2B0035330F /* Resources */,
 				D0E1D0E1D0E1D0E1D0E1D0E1 /* Bundle halo-runtime */,
+				D0E2D0E2D0E2D0E2D0E2D0E2 /* Bundle llama-runtime */,
 			);
 			buildRules = (
 			);
@@ -136,6 +137,26 @@
 			shellPath = /bin/sh;
 			shellScript = "set -e\nREPO=\"$SRCROOT/../..\"\nif [ ! -f \"$REPO/scripts/build-runtime.sh\" ]; then\n  echo \"error: $REPO/scripts/build-runtime.sh not found\" >&2\n  exit 1\nfi\n\"$REPO/scripts/build-runtime.sh\"\nDEST=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\nmkdir -p \"$DEST\"\ncp \"$REPO/halo-runtime\" \"$DEST/halo-runtime\"\nchmod +x \"$DEST/halo-runtime\"\n";
 		};
+		D0E2D0E2D0E2D0E2D0E2D0E2 /* Bundle llama-runtime */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Bundle llama-runtime";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/llama-runtime/llama-server",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\nREPO=\"$SRCROOT/../..\"\nif [ ! -f \"$REPO/scripts/build-llama-server.sh\" ]; then\n  echo \"error: $REPO/scripts/build-llama-server.sh not found\" >&2\n  exit 1\nfi\n\"$REPO/scripts/build-llama-server.sh\"\nSRC=\"$REPO/llama-runtime\"\nDEST=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/llama-runtime\"\nmkdir -p \"$DEST\"\n# Copy binary + dylibs (rpath = @loader_path so they must sit\n# alongside llama-server). ditto overwrites in place and preserves\n# symlinks for the libfoo.0.dylib -> libfoo.0.X.Y.dylib chain.\nditto \"$SRC/llama-server\" \"$DEST/llama-server\"\nchmod +x \"$DEST/llama-server\"\nfor dylib in \"$SRC\"/lib*.dylib; do\n  ditto \"$dylib\" \"$DEST/$(basename \"$dylib\")\"\ndone\n# Death-pact wrapper — the script ModelServer.swift actually spawns.\n# Polls the Mac app's pid and SIGKILLs llama-server when parent dies\n# (force-kill, crash). Without this llama-server orphans to launchd\n# holding ~3GB of RAM with the GGUF mmap'd.\nditto \"$REPO/scripts/llama-server-supervised.sh\" \"$DEST/llama-server-supervised.sh\"\nchmod +x \"$DEST/llama-server-supervised.sh\"\n";
+		};
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -187,7 +208,7 @@
 				DEVELOPMENT_TEAM = LL635KMB93;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -251,7 +272,7 @@
 				DEVELOPMENT_TEAM = LL635KMB93;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;

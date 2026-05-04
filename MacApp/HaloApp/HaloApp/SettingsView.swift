@@ -57,21 +57,24 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var content: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            switch selected {
-            case .model:     modelPane
-            case .memory:    MemoryPane()
-            case .shortcuts: ShortcutsPane()
-            case .hotkey:    hotkeyPane
-            default:
-                Text(selected.label)
-                    .font(.haloUI(13, weight: .medium))
-                    .foregroundStyle(Color.haloFgDim)
-                    .padding(20)
-                Spacer()
+        ScrollView(.vertical, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: 0) {
+                switch selected {
+                case .model:     modelPane
+                case .memory:    MemoryPane()
+                case .shortcuts: ShortcutsPane()
+                case .hotkey:    hotkeyPane
+                default:
+                    Text(selected.label)
+                        .font(.haloUI(13, weight: .medium))
+                        .foregroundStyle(Color.haloFgDim)
+                        .padding(20)
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20).padding(.top, 14).padding(.bottom, 20)
         }
-        .padding(.horizontal, 20).padding(.top, 14).padding(.bottom, 20)
+        .scrollBounceBehavior(.basedOnSize)
     }
 
     // MARK: - Model pane
@@ -94,7 +97,7 @@ struct SettingsView: View {
                     .foregroundStyle(Color.haloFgFaint)
             }
             .padding(.bottom, 4)
-            Text("Pre-download to be ready when built-in inference ships in v8.5.")
+            Text("Vetted GGUFs from HuggingFace, pinned by SHA-256. Download to use offline.")
                 .font(.haloUI(11))
                 .foregroundStyle(Color.haloFgFaint)
                 .padding(.bottom, 10)
@@ -421,17 +424,17 @@ private struct EndpointCard: View {
     var body: some View {
         @Bindable var state = state
         VStack(alignment: .leading, spacing: 0) {
-            // Mode toggle — segmented, with bundled disabled until v8.5.
+            // Mode toggle — segmented. Bundled is fully functional now
+            // that v8.5 ships llama-server in Resources/llama-runtime/.
             HStack(spacing: 8) {
                 ForEach(EndpointMode.allCases) { mode in
                     EndpointModePill(
                         mode: mode,
                         selected: state.endpointMode == mode,
-                        disabled: mode == .bundled,
+                        disabled: false,
                         action: {
-                            guard mode != .bundled else { return }
                             if state.endpointMode != mode {
-                                state.endpointMode = mode  // didSet → AppDelegate restarts the runtime
+                                state.endpointMode = mode  // didSet → AppDelegate restarts the stack
                             }
                         }
                     )
@@ -444,7 +447,7 @@ private struct EndpointCard: View {
             case .external:
                 externalURLRow(state: state)
             case .bundled:
-                bundledPreviewBlurb
+                bundledStatusRow
             }
         }
         .padding(.horizontal, 14).padding(.vertical, 12)
@@ -494,12 +497,26 @@ private struct EndpointCard: View {
         }
     }
 
-    private var bundledPreviewBlurb: some View {
-        Text("Built-in inference ships in v8.5. Until then, point Milo at your own endpoint above. You can pre-download vetted models in the list below.")
-            .font(.haloUI(11.5))
-            .foregroundStyle(Color.haloFgDim)
-            .lineSpacing(2)
-            .frame(maxWidth: 420, alignment: .leading)
+    @ViewBuilder
+    private var bundledStatusRow: some View {
+        let installed = ModelCatalog.shared.entries.filter {
+            if case .installed = $0.availability { return true }
+            return false
+        }
+        if installed.isEmpty {
+            Text("No models installed yet. Download one from the list below to start using built-in inference.")
+                .font(.haloUI(11.5))
+                .foregroundStyle(Color.haloFgDim)
+                .lineSpacing(2)
+                .frame(maxWidth: 420, alignment: .leading)
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Active model")
+                    .font(.haloUI(11, weight: .medium))
+                    .foregroundStyle(Color.haloFgDim)
+                BundledModelPicker(installed: installed)
+            }
+        }
     }
 
     private func applyURL() {
@@ -509,6 +526,50 @@ private struct EndpointCard: View {
         // URL changes don't fire onEndpointChange (avoids per-keystroke
         // restart). Trigger an explicit restart here.
         AppDelegate.shared?.applyEndpointChanges()
+    }
+}
+
+/// Compact picker shown when bundled mode is on and at least one model
+/// is installed. Tapping a row makes that model the one llama-server
+/// is loaded with — AppState.selectedModelId change kicks AppDelegate
+/// to restart ModelServer.
+private struct BundledModelPicker: View {
+    let installed: [ModelEntry]
+    @Environment(AppState.self) private var state
+
+    var body: some View {
+        @Bindable var state = state
+        VStack(spacing: 4) {
+            ForEach(installed) { entry in
+                let isSelected = (state.selectedModelId ?? installed.first?.id) == entry.id
+                Button(action: {
+                    state.selectedModelId = entry.id
+                }) {
+                    HStack(spacing: 10) {
+                        ZStack {
+                            Circle().stroke(Color.white.opacity(isSelected ? 0.55 : 0.18), lineWidth: 1)
+                            if isSelected {
+                                Circle().fill(Color.haloAccent).padding(3)
+                            }
+                        }
+                        .frame(width: 12, height: 12)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(entry.model.name).font(.haloUI(12))
+                            Text("\(entry.model.params) · \(entry.model.quant)")
+                                .font(.haloMono(10))
+                                .foregroundStyle(Color.haloFgFaint)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 8).padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(isSelected ? Color.haloAccent.opacity(0.08) : .clear)
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
     }
 }
 

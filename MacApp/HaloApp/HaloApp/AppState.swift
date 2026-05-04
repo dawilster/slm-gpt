@@ -77,6 +77,24 @@ final class AppState {
         }
     }
 
+    /// ID of the catalog entry the user picked for bundled inference.
+    /// Drives ModelServer's `--model` arg. Nil until the user picks one
+    /// (defaults to the first installed entry on bundled-mode boot).
+    var selectedModelId: String? = AppState.loadSelectedModelId() {
+        didSet {
+            if let id = selectedModelId {
+                UserDefaults.standard.set(id, forKey: AppState.selectedModelKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: AppState.selectedModelKey)
+            }
+            onSelectedModelChange?()
+        }
+    }
+
+    /// Set by AppDelegate so AppState can trigger a ModelServer reload
+    /// when the user picks a different bundled model from Settings.
+    var onSelectedModelChange: (() -> Void)?
+
     /// Set by AppDelegate so AppState can trigger a runtime restart when
     /// the endpoint mode flips (URL changes are committed via an explicit
     /// "Apply" action so we don't restart on every keystroke).
@@ -134,10 +152,16 @@ final class AppState {
 
     static let endpointModeKey      = "halo.endpointMode"
     static let externalEndpointKey  = "halo.externalEndpoint"
+    static let selectedModelKey     = "halo.selectedModelId"
 
     /// What halo-runtime defaulted to before we made it configurable —
     /// keeping the same value here means upgrading users see no change.
     static let defaultExternalEndpoint = "http://localhost:1234/v1"
+
+    /// Where the bundled llama-server listens. Mirrors ModelServer.port.
+    /// Hardcoded twice (here + ModelServer.swift) intentionally — this
+    /// is read at AppState init before ModelServer.shared is available.
+    static let bundledModelBaseURL = "http://127.0.0.1:1235/v1"
 
     private static func loadEndpointMode() -> EndpointMode {
         let raw = UserDefaults.standard.string(forKey: endpointModeKey) ?? EndpointMode.external.rawValue
@@ -148,13 +172,16 @@ final class AppState {
         UserDefaults.standard.string(forKey: externalEndpointKey) ?? defaultExternalEndpoint
     }
 
-    /// Resolved endpoint URL based on current mode. Until v8.5 ships
-    /// llama-server, `bundled` falls back to whatever external is set to
-    /// — the UI prevents the user from selecting bundled if it's not
-    /// supported, so this fallback is defense-in-depth, not policy.
+    private static func loadSelectedModelId() -> String? {
+        UserDefaults.standard.string(forKey: selectedModelKey)
+    }
+
+    /// Resolved endpoint URL the harness should talk to right now.
+    /// Bundled mode points at the in-process llama-server; external
+    /// points at whatever the user pasted.
     var resolvedModelBaseURL: String {
         switch endpointMode {
-        case .bundled:  return AppState.defaultExternalEndpoint  // placeholder — real bundled URL lands at v8.5
+        case .bundled:  return AppState.bundledModelBaseURL
         case .external: return externalEndpointURL.isEmpty ? AppState.defaultExternalEndpoint : externalEndpointURL
         }
     }
