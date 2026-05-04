@@ -76,29 +76,32 @@ struct SettingsView: View {
 
     // MARK: - Model pane
 
-    fileprivate struct ModelRow: Identifiable {
-        let id = UUID()
-        let name: String
-        let sub: String
-        let action: String
-        let installed: Bool
-    }
-    private let available: [ModelRow] = [
-        .init(name: "Qwen 2.5 · 7B Instruct",       sub: "q5_K_M · 5.2 GB",                  action: "Installed", installed: true),
-        .init(name: "Phi-3 · 3.8B Mini",            sub: "q4 · 2.3 GB · faster",             action: "Installed", installed: true),
-        .init(name: "Llama 3.3 · 70B Instruct",     sub: "q4 · 39 GB · highest quality",     action: "Download",  installed: false),
-        .init(name: "Mistral Small · 22B",          sub: "q4 · 13 GB",                       action: "Download",  installed: false),
-    ]
-
     private var modelPane: some View {
         VStack(alignment: .leading, spacing: 0) {
+            sectionHeader("Endpoint").padding(.bottom, 10)
+            EndpointCard().padding(.bottom, 18)
+
             sectionHeader("Active model").padding(.bottom, 10)
             activeModelCard.padding(.bottom, 18)
 
-            sectionHeader("Available").padding(.bottom, 8)
+            HStack(alignment: .firstTextBaseline) {
+                sectionHeader("Vetted models")
+                Spacer(minLength: 0)
+                // Honest framing — bundled inference doesn't ship until
+                // v8.5. Until then the catalog is "manage your library."
+                Text("\(SystemInfo.totalRAMGB) GB RAM · \(SystemInfo.freeDiskGB()) GB free")
+                    .font(.haloMono(10))
+                    .foregroundStyle(Color.haloFgFaint)
+            }
+            .padding(.bottom, 4)
+            Text("Pre-download to be ready when built-in inference ships in v8.5.")
+                .font(.haloUI(11))
+                .foregroundStyle(Color.haloFgFaint)
+                .padding(.bottom, 10)
+
             VStack(spacing: 0) {
-                ForEach(Array(available.enumerated()), id: \.element.id) { i, m in
-                    ModelListRow(model: m, drawTopRule: i > 0)
+                ForEach(Array(ModelCatalog.shared.entries.enumerated()), id: \.element.id) { i, entry in
+                    CatalogModelRow(entry: entry, drawTopRule: i > 0)
                 }
             }
         }
@@ -249,38 +252,48 @@ private struct SidebarRow: View {
     }
 }
 
-// MARK: - Available model row with hover + download action
+// MARK: - Catalog row — live model entry with download/delete affordances
 
-private struct ModelListRow: View {
-    let model: SettingsView.ModelRow
+private struct CatalogModelRow: View {
+    let entry: ModelEntry
     let drawTopRule: Bool
 
     @State private var hovered = false
-    @State private var downloading = false
 
     var body: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(model.name).font(.haloUI(12.5))
-                Text(model.sub)
-                    .font(.haloMono(10.5))
-                    .foregroundStyle(Color.haloFgFaint)
-            }
-            Spacer(minLength: 0)
-            if model.installed {
-                Text("Installed")
-                    .font(.haloUI(11))
-                    .foregroundStyle(Color.haloFgFaint)
-            } else {
-                Button(action: { downloading.toggle() }) {
-                    Text(downloading ? "Downloading…" : "Download")
-                        .font(.haloUI(11, weight: .medium))
-                        .foregroundStyle(downloading ? Color.haloFgFaint : Color.haloAccent)
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(entry.model.name).font(.haloUI(12.5))
+                    Text(specLine).font(.haloMono(10.5))
+                        .foregroundStyle(Color.haloFgFaint)
+                    Text(entry.model.tagline)
+                        .font(.haloUI(11))
+                        .foregroundStyle(Color.haloFgDim)
+                        .padding(.top, 2)
                 }
-                .buttonStyle(.plain)
+                Spacer(minLength: 0)
+                actionButton
+            }
+
+            // Inline progress when downloading. Below the row, full width.
+            if let dl = entry.downloader, case .running(let p, let bps) = dl.state {
+                progressStrip(progress: p, bps: bps)
+                    .padding(.top, 8)
+            } else if let dl = entry.downloader, case .verifying = dl.state {
+                progressStrip(progress: 1.0, bps: 0, label: "Verifying SHA-256…")
+                    .padding(.top, 8)
+            } else if let dl = entry.downloader, case .failed(let reason) = dl.state {
+                Text("Failed: \(reason)")
+                    .font(.haloUI(10.5))
+                    .foregroundStyle(Color.haloWarn)
+                    .padding(.top, 4)
+            } else if let dl = entry.downloader, case .paused(let p) = dl.state {
+                progressStrip(progress: p, bps: 0, label: "Paused")
+                    .padding(.top, 8)
             }
         }
-        .padding(.horizontal, 8).padding(.vertical, 10)
+        .padding(.horizontal, 8).padding(.vertical, 12)
         .background(
             RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .fill(hovered ? Color.white.opacity(0.04) : .clear)
@@ -293,6 +306,253 @@ private struct ModelListRow: View {
         }
         .contentShape(Rectangle())
         .onHover { hovered = $0 }
+    }
+
+    private var specLine: String {
+        let sizeGB = Double(entry.model.sizeBytes) / 1_000_000_000
+        return "\(entry.model.params) · \(entry.model.quant) · \(String(format: "%.1f GB", sizeGB)) · \(entry.model.context / 1024)K ctx"
+    }
+
+    @ViewBuilder
+    private var actionButton: some View {
+        switch entry.availability {
+        case .ramBlocked(let need):
+            Text("Needs \(need)GB+")
+                .font(.haloUI(10.5, weight: .medium))
+                .foregroundStyle(Color.haloFgFaint)
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .background(Color.white.opacity(0.05))
+                .clipShape(Capsule())
+        case .available:
+            Button(action: { ModelCatalog.shared.startDownload(for: entry.id) }) {
+                Text("Download")
+                    .font(.haloUI(11, weight: .medium))
+                    .foregroundStyle(Color.haloAccent)
+            }
+            .buttonStyle(.plain)
+        case .downloading:
+            HStack(spacing: 6) {
+                if let dl = entry.downloader, case .running = dl.state {
+                    Button(action: { ModelCatalog.shared.pauseDownload(for: entry.id) }) {
+                        Text("Pause")
+                            .font(.haloUI(10.5))
+                            .foregroundStyle(Color.haloFgDim)
+                    }
+                    .buttonStyle(.plain)
+                } else if let dl = entry.downloader, case .paused = dl.state {
+                    Button(action: { ModelCatalog.shared.startDownload(for: entry.id) }) {
+                        Text("Resume")
+                            .font(.haloUI(10.5))
+                            .foregroundStyle(Color.haloAccent)
+                    }
+                    .buttonStyle(.plain)
+                }
+                Button(action: { ModelCatalog.shared.cancelOrDelete(entry.id) }) {
+                    Text("Cancel")
+                        .font(.haloUI(10.5))
+                        .foregroundStyle(Color.haloFgDim)
+                }
+                .buttonStyle(.plain)
+            }
+        case .installed:
+            HStack(spacing: 8) {
+                HStack(spacing: 4) {
+                    Circle().fill(Color.haloGreen).frame(width: 5, height: 5)
+                    Text("Installed").font(.haloUI(10.5))
+                }
+                .foregroundStyle(Color.haloFgDim)
+                Button(action: { ModelCatalog.shared.cancelOrDelete(entry.id) }) {
+                    Text("Delete")
+                        .font(.haloUI(10.5))
+                        .foregroundStyle(Color.haloWarn)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private func progressStrip(progress: Double, bps: Int64, label: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ProgressBarView(value: progress)
+            HStack {
+                Text(label ?? String(format: "%.1f%%", progress * 100))
+                Spacer(minLength: 0)
+                if bps > 0 {
+                    Text(formatBPS(bps))
+                }
+                Spacer(minLength: 0)
+                Text(remainingString(progress: progress))
+            }
+            .font(.haloMono(10))
+            .foregroundStyle(Color.haloFgFaint)
+            .monospacedDigit()
+        }
+    }
+
+    private func formatBPS(_ bps: Int64) -> String {
+        if bps > 1_000_000 {
+            return String(format: "%.1f MB/s", Double(bps) / 1_000_000)
+        }
+        return String(format: "%.0f KB/s", Double(bps) / 1_000)
+    }
+
+    private func remainingString(progress: Double) -> String {
+        let bytesLeft = Int64(Double(entry.model.sizeBytes) * (1.0 - progress))
+        let mb = Double(bytesLeft) / 1_000_000
+        return String(format: "%.0f MB left", mb)
+    }
+}
+
+// MARK: - Endpoint card
+
+/// "Where does the brain get its model from?" — the orchestrator
+/// contract from design.md §3.8 surfaced in the Settings UI. Bundled
+/// mode is intentionally disabled until v8.5 ships llama-server; the
+/// preview tag is honest about that.
+private struct EndpointCard: View {
+    @Environment(AppState.self) private var state
+
+    /// Local working copy so the user can type the URL without us
+    /// firing a runtime restart on every keystroke. Committed via
+    /// the explicit Apply button.
+    @State private var draftURL: String = ""
+    @State private var hasLoadedDraft = false
+
+    var body: some View {
+        @Bindable var state = state
+        VStack(alignment: .leading, spacing: 0) {
+            // Mode toggle — segmented, with bundled disabled until v8.5.
+            HStack(spacing: 8) {
+                ForEach(EndpointMode.allCases) { mode in
+                    EndpointModePill(
+                        mode: mode,
+                        selected: state.endpointMode == mode,
+                        disabled: mode == .bundled,
+                        action: {
+                            guard mode != .bundled else { return }
+                            if state.endpointMode != mode {
+                                state.endpointMode = mode  // didSet → AppDelegate restarts the runtime
+                            }
+                        }
+                    )
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.bottom, 12)
+
+            switch state.endpointMode {
+            case .external:
+                externalURLRow(state: state)
+            case .bundled:
+                bundledPreviewBlurb
+            }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 12)
+        .background(Color.white.opacity(0.04))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.white.opacity(0.10), lineWidth: 0.5)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .onAppear {
+            if !hasLoadedDraft {
+                draftURL = state.externalEndpointURL
+                hasLoadedDraft = true
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func externalURLRow(state: AppState) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("OpenAI-compatible endpoint")
+                .font(.haloUI(11, weight: .medium))
+                .foregroundStyle(Color.haloFgDim)
+
+            HStack(spacing: 8) {
+                TextField("http://localhost:1234/v1", text: $draftURL)
+                    .textFieldStyle(.plain)
+                    .font(.haloMono(12))
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .background(Color.black.opacity(0.18))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .stroke(Color.white.opacity(0.10), lineWidth: 0.5)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+
+                Button(action: applyURL) {
+                    Text("Apply")
+                }
+                .buttonStyle(HaloButtonStyle(fontSize: 12, paddingH: 12, paddingV: 6))
+                .disabled(draftURL.trimmingCharacters(in: .whitespaces) == state.externalEndpointURL)
+            }
+
+            Text("LM Studio (port 1234), Ollama (11434), or any OpenAI-compatible server.")
+                .font(.haloUI(11))
+                .foregroundStyle(Color.haloFgFaint)
+        }
+    }
+
+    private var bundledPreviewBlurb: some View {
+        Text("Built-in inference ships in v8.5. Until then, point Milo at your own endpoint above. You can pre-download vetted models in the list below.")
+            .font(.haloUI(11.5))
+            .foregroundStyle(Color.haloFgDim)
+            .lineSpacing(2)
+            .frame(maxWidth: 420, alignment: .leading)
+    }
+
+    private func applyURL() {
+        let trimmed = draftURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != state.externalEndpointURL else { return }
+        state.externalEndpointURL = trimmed
+        // URL changes don't fire onEndpointChange (avoids per-keystroke
+        // restart). Trigger an explicit restart here.
+        AppDelegate.shared?.applyEndpointChanges()
+    }
+}
+
+private struct EndpointModePill: View {
+    let mode: EndpointMode
+    let selected: Bool
+    let disabled: Bool
+    let action: () -> Void
+
+    @State private var hovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Text(mode.label)
+                    .font(.haloUI(12, weight: selected ? .medium : .regular))
+                if disabled {
+                    Text("preview")
+                        .font(.haloUI(9, weight: .semibold))
+                        .tracking(0.6)
+                        .textCase(.uppercase)
+                        .foregroundStyle(Color.haloAccent.opacity(0.85))
+                        .padding(.horizontal, 5).padding(.vertical, 2)
+                        .background(Color.haloAccent.opacity(0.15))
+                        .clipShape(Capsule())
+                }
+            }
+            .foregroundStyle(disabled ? Color.haloFgFaint
+                              : (selected ? Color.haloFg : Color.haloFgDim))
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(selected ? Color.white.opacity(0.10)
+                          : (hovered && !disabled ? Color.white.opacity(0.05) : .clear))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .stroke(selected ? Color.white.opacity(0.18) : Color.white.opacity(0.08),
+                            lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
+        .help(disabled ? "Built-in inference ships in v8.5" : "")
     }
 }
 

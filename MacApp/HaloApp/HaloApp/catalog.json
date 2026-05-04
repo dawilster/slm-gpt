@@ -1,0 +1,45 @@
+{
+  "$comment": "Vetted local model catalog. Each entry has a pinned SHA256 — the 'vetting' is that we picked these GGUFs, tested them on our reference hardware, and pinned the exact bytes. New models = new app release. See design.md §3.8.",
+  "version": 1,
+  "models": [
+    {
+      "id": "qwen2.5-1.5b-instruct-q4km",
+      "name": "Qwen 2.5 · 1.5B Instruct",
+      "tagline": "Smallest viable. Fast on any 8GB Mac.",
+      "params": "1.5B",
+      "quant": "Q4_K_M",
+      "sizeBytes": 986048768,
+      "ramRequiredMB": 2200,
+      "context": 32768,
+      "url": "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+      "sha256": "1adf0b11065d8ad2e8123ea110d1ec956dab4ab038eab665614adba04b6c3370",
+      "minRamGB": 8
+    },
+    {
+      "id": "qwen3-4b-instruct-2507-q4km",
+      "name": "Qwen 3 · 4B Instruct (2507)",
+      "tagline": "Recommended. Sharp tool calling, fits 8GB.",
+      "params": "4B",
+      "quant": "Q4_K_M",
+      "sizeBytes": 2497281120,
+      "ramRequiredMB": 4500,
+      "context": 32768,
+      "url": "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+      "sha256": "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597",
+      "minRamGB": 8
+    },
+    {
+      "id": "qwen2.5-7b-instruct-q4km",
+      "name": "Qwen 2.5 · 7B Instruct",
+      "tagline": "Higher quality. Needs 16GB+.",
+      "params": "7B",
+      "quant": "Q4_K_M",
+      "sizeBytes": 4683074240,
+      "ramRequiredMB": 7500,
+      "context": 32768,
+      "url": "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+      "sha256": "65b8fcd92af6b4fefa935c625d1ac27ea29dcb6ee14589c55a8f115ceaaa1423",
+      "minRamGB": 16
+    }
+  ]
+}

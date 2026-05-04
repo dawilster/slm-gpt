@@ -143,6 +143,26 @@ final class RuntimeServer {
         state = .stopped
     }
 
+    /// Stop (if running) and start again — used when a setting change
+    /// (e.g. endpoint URL) needs the runtime to pick up new env. If we
+    /// only attached to an external runtime, restart is a no-op except
+    /// for re-running the probe (the external owner manages its own
+    /// lifecycle).
+    func restart() async {
+        if case .external = state {
+            log.info("restart skipped — runtime is external (attached, not spawned)")
+            // Re-probe so the UI reflects whatever's there now.
+            state = .probing
+            if await healthOK() { state = .external } else { await spawn() }
+            return
+        }
+        stop()
+        // Reset crash budget — an explicit restart shouldn't count
+        // against the auto-recovery limit.
+        restartsRemaining = 1
+        await start()
+    }
+
     // MARK: - Spawn
 
     private func spawn() async {
@@ -159,7 +179,7 @@ final class RuntimeServer {
             FileManager.default.createFile(atPath: logFileURL.path, contents: nil)
         }
         let handle = try? FileHandle(forWritingTo: logFileURL)
-        try? handle?.seekToEnd()
+        _ = try? handle?.seekToEnd()
         let header = "\n=== \(ISO8601DateFormatter().string(from: Date())) — spawn \(binary.path) ===\n"
         try? handle?.write(contentsOf: Data(header.utf8))
         logHandle = handle
@@ -177,6 +197,13 @@ final class RuntimeServer {
         // Make sure HOME is set — the runtime resolves ~/.assistant/ from it.
         if env["HOME"] == nil {
             env["HOME"] = NSHomeDirectory()
+        }
+        // Tell the harness which inference endpoint to use. The Mac app is
+        // the orchestrator (design.md §3.8) — the harness must not hold
+        // its own opinion. An ambient process-env override still wins, so
+        // dev workflows that pre-set MODEL_BASE_URL keep working.
+        if env["MODEL_BASE_URL"] == nil {
+            env["MODEL_BASE_URL"] = AppState.shared.resolvedModelBaseURL
         }
         p.environment = env
 

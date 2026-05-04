@@ -61,6 +61,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppState.shared.runtimeProcessState = RuntimeServer.shared.state
         Task { await RuntimeServer.shared.start() }
 
+        // Restart the runtime when the user toggles endpoint mode in
+        // Settings. URL-field edits are debounced and applied via the
+        // explicit applyEndpointChanges() call below.
+        AppState.shared.onEndpointChange = { [weak self] in
+            self?.applyEndpointChanges()
+        }
+
         // Periodic runtime health probe — drives the "Ready / Offline" status
         // in the dock and the menubar dropdown.
         startHealthProbe()
@@ -123,6 +130,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// SIGKILL with a 3s grace window — see RuntimeServer.stop().
     func applicationWillTerminate(_ notification: Notification) {
         RuntimeServer.shared.stop()
+    }
+
+    /// Restart the runtime so it picks up new MODEL_BASE_URL from
+    /// AppState. Called by the endpoint settings flow — both the mode
+    /// toggle and the explicit "Apply" button on the URL field route
+    /// here so the Settings UI has one path that does the right thing.
+    func applyEndpointChanges() {
+        Task { await RuntimeServer.shared.restart() }
     }
 
     // MARK: Hotkey
@@ -205,11 +220,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let view = OnboardingView(
                 onContinue: { [weak self] in
                     AppState.shared.hasCompletedOnboarding = true
+                    AppState.shared.hasCompletedFirstRun = true  // FirstRun is reserved for v8.5 (real model download); skip in A+B
                     close()
-                    self?.showFirstRun()
+                    self?.showDock()
                 },
                 onTryNow: { [weak self] in
                     AppState.shared.hasCompletedOnboarding = true
+                    AppState.shared.hasCompletedFirstRun = true
                     close()
                     self?.showDock()
                 },
@@ -238,7 +255,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     // chat so they don't have to find the menubar themselves.
                     self?.showDock()
                 },
-                onClose: close
+                onClose: close,
+                onChooseAnother: { [weak self] in
+                    close()
+                    self?.showSettings()
+                }
             )
             firstRunController = AuxiliaryWindowController(
                 title: "Setup Milo",
