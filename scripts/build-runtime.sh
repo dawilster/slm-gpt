@@ -16,8 +16,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Xcode build phases run with a minimal PATH that omits Homebrew's prefix,
+# so a `bun` installed via brew won't be found unless we extend the search
+# paths ourselves. Cover both Apple Silicon (/opt/homebrew) and Intel
+# (/usr/local) brew prefixes, plus the default user-install location.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.bun/bin:$PATH"
+
 if ! command -v bun >/dev/null 2>&1; then
-  echo "error: bun not found on PATH" >&2
+  echo "error: bun not found on PATH (looked in: $PATH)" >&2
+  echo "hint: install with 'brew install bun' or 'curl -fsSL https://bun.sh/install | bash'" >&2
   exit 1
 fi
 
