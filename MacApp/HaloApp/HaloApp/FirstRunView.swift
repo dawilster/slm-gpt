@@ -54,11 +54,11 @@ struct FirstRunView: View {
                     Spacer(minLength: 0)
 
                     HStack(spacing: 8) {
-                        Button(action: togglePause) {
-                            Text(pauseLabel)
+                        Button(action: cancel) {
+                            Text("Cancel")
                         }
                         .buttonStyle(HaloButtonStyle(fontSize: 11.5, paddingH: 10, paddingV: 5))
-                        .disabled(pauseDisabled)
+                        .disabled(cancelDisabled)
 
                         Button(action: onChooseAnother) {
                             Text("Choose another")
@@ -107,16 +107,12 @@ struct FirstRunView: View {
         }
     }
 
-    private func togglePause() {
-        guard let entry, let dl = entry.downloader else { return }
-        switch dl.state {
-        case .running:
-            ModelCatalog.shared.pauseDownload(for: entry.id)
-        case .paused:
-            ModelCatalog.shared.startDownload(for: entry.id)
-        default:
-            break
-        }
+    /// Cancel the in-flight download. Files already on disk stay; if
+    /// the user re-summons FirstRun, the loop resumes from where it
+    /// stopped (per-file granularity).
+    private func cancel() {
+        guard let entry else { return }
+        ModelCatalog.shared.cancelOrDelete(entry.id)
     }
 
     // MARK: - Derived UI bits
@@ -126,7 +122,6 @@ struct FirstRunView: View {
         if case .installed = entry.availability { return .idle }
         if let dl = entry.downloader, case .verifying = dl.state { return .thinking }
         if let dl = entry.downloader, case .running = dl.state { return .loading }
-        if let dl = entry.downloader, case .paused = dl.state { return .idle }
         return .loading
     }
 
@@ -148,12 +143,12 @@ struct FirstRunView: View {
     }
 
     private var verifiedLabel: String {
-        guard let entry, let dl = entry.downloader else { return "Pinned · SHA-256" }
+        guard let entry, let dl = entry.downloader else { return "Pinned revision" }
         switch dl.state {
-        case .verifying: return "Verifying SHA-256…"
-        case .finished:  return "Verified · SHA-256"
+        case .verifying: return "Verifying…"
+        case .finished:  return "Verified"
         case .failed(let r): return "Failed · \(r)"
-        default: return "Pinned · SHA-256"
+        default: return "Pinned revision"
         }
     }
 
@@ -166,18 +161,10 @@ struct FirstRunView: View {
         }
     }
 
-    private var pauseLabel: String {
-        guard let entry, let dl = entry.downloader else { return "Pause" }
-        if case .paused = dl.state { return "Resume" }
-        return "Pause"
-    }
-
-    private var pauseDisabled: Bool {
+    private var cancelDisabled: Bool {
         guard let entry, let dl = entry.downloader else { return true }
-        switch dl.state {
-        case .running, .paused: return false
-        default: return true
-        }
+        if case .running = dl.state { return false }
+        return true
     }
 
     @ViewBuilder

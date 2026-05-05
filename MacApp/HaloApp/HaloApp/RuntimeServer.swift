@@ -54,6 +54,13 @@ enum RuntimeProcessState: Equatable, Sendable {
 final class RuntimeServer {
     static let shared = RuntimeServer()
 
+    /// One-shot override for the next spawn's MODEL_BASE_URL. Set by
+    /// AppDelegate.bootInferenceStack when bundled mode has no usable
+    /// model — the harness still needs *some* working endpoint, so we
+    /// transparently point it at the user's external URL for this boot.
+    /// Cleared after the spawn consumes it.
+    var nextSpawnURLOverride: String?
+
     private(set) var state: RuntimeProcessState = .notStarted {
         didSet {
             log.info("state → \(self.state.label, privacy: .public)")
@@ -203,7 +210,14 @@ final class RuntimeServer {
         // its own opinion. An ambient process-env override still wins, so
         // dev workflows that pre-set MODEL_BASE_URL keep working.
         if env["MODEL_BASE_URL"] == nil {
-            env["MODEL_BASE_URL"] = AppState.shared.resolvedModelBaseURL
+            // One-shot override (bundled-fallback case) wins over
+            // AppState's resolved URL. Cleared after consumption.
+            if let override = nextSpawnURLOverride {
+                env["MODEL_BASE_URL"] = override
+                nextSpawnURLOverride = nil
+            } else {
+                env["MODEL_BASE_URL"] = AppState.shared.resolvedModelBaseURL
+            }
         }
         p.environment = env
 

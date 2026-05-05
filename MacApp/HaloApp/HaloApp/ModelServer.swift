@@ -29,15 +29,23 @@ enum ModelServerState: Equatable, Sendable {
     }
 }
 
-/// Owns the lifecycle of the bundled `llama-server` process — the
-/// second instance of the orchestrator pattern (design.md §3.8). The
-/// Mac app spawns this *first*, waits for it to come up, then spawns
-/// the harness with `MODEL_BASE_URL` pointed at it.
+/// Owns the lifecycle of the bundled `SwiftLM` process — the second
+/// instance of the orchestrator pattern (design.md §3.8). The Mac app
+/// spawns this *first*, waits for it to come up, then spawns the
+/// harness with `MODEL_BASE_URL` pointed at it.
 ///
-/// Listens on :1235 (vs LM Studio's conventional :1234). Spawned with
-/// `--model <gguf-path> --port 1235 --ctx-size N`. Crashes on its own
-/// when the model file is corrupt; we surface that as `.crashed` and
-/// the AppDelegate decides whether to fall back to external mode.
+/// SwiftLM is a native MLX inference server (Swift, no Python). It
+/// listens on :1235 (vs LM Studio's conventional :1234). Spawned with
+/// `--model <local-mlx-dir> --port 1235`. We use a local directory
+/// path rather than a HuggingFace ID so the user's selected catalog
+/// model (downloaded into our own storage with our SHA-pinned
+/// integrity check) is what actually loads.
+///
+/// Why MLX over llama.cpp/GGUF: design.md §3.8 originally chose
+/// llama-server for portability, but we now target M-series only — so
+/// MLX wins on tok/s (25 vs 20 in our perf eval), keeps parity with
+/// the user's existing mlx-community model collection, and avoids
+/// architecture-support gaps (Qwen3.5 not in llama.cpp b9025).
 @MainActor
 final class ModelServer {
     static let shared = ModelServer()
@@ -124,25 +132,30 @@ final class ModelServer {
 
         let p = Process()
         p.executableURL = binary
-        // Context size comes from the catalog (32K is typical for Qwen3
+        // Context size comes from the catalog (32K typical for Qwen3
         // family). KV cache cost: roughly 0.5MB/token at f16, so a 32K
         // context budget is ~16GB of headroom — fine on M-series with
         // mmap'd weights but we cap at 8K on 8GB Macs to leave room for
         // user apps. Surfaces as a load-time setting in v8.5+.
         let contextLimit = ramAdjustedContext(for: entry.model)
-        p.arguments = [
-            "--model", entry.installedURL.path,
+        var args = [
+            "--model", entry.installedURL.path,  // local MLX directory
             "--port", String(port),
             "--host", "127.0.0.1",
             "--ctx-size", String(contextLimit),
-            "--n-gpu-layers", "999",  // offload everything to Metal — fastest on Apple Silicon
-            "--alias", entry.id,       // shows up as the OpenAI model name
-            "--log-prefix",            // colorless line prefixes, cleaner in our log file
         ]
+        // VLM (vision-language) models have weights namespaced under
+        // `language_model.*` rather than `model.*`. SwiftLM needs the
+        // `--vision` flag to route them correctly — without it we get
+        // "Key language_model.model.embed_tokens.weight not found".
+        if entry.model.isVisionModel == true {
+            args.append("--vision")
+        }
+        p.arguments = args
         var env = ProcessInfo.processInfo.environment
         // Death-pact: the supervisor wrapper polls this pid and SIGKILLs
-        // llama-server when the Mac app dies. Without it the model server
-        // orphans to launchd holding ~3GB of RAM with the GGUF mmap'd.
+        // SwiftLM when the Mac app dies. Without it the model server
+        // orphans to launchd holding ~2-3GB of RAM with the model loaded.
         env["HALO_PARENT_PID"] = String(ProcessInfo.processInfo.processIdentifier)
         p.environment = env
 
@@ -261,28 +274,28 @@ final class ModelServer {
     }
 
     private func locateBinary() -> URL? {
-        // We invoke the *supervisor* shell wrapper, not llama-server
-        // directly — the wrapper handles parent-pid death-pact and
-        // exec's llama-server next to it. Sits in the same dir so
-        // @loader_path dylib resolution still works.
-        let wrapperName = "llama-server-supervised.sh"
+        // We invoke the *supervisor* shell wrapper, not SwiftLM directly
+        // — the wrapper handles parent-pid death-pact and execs SwiftLM
+        // from the same dir (mlx.metallib must sit alongside the
+        // binary, hence the cd in the wrapper).
+        let wrapperName = "swiftlm-supervised.sh"
 
-        if let res = Bundle.main.resourceURL?.appendingPathComponent("llama-runtime/\(wrapperName)"),
+        if let res = Bundle.main.resourceURL?.appendingPathComponent("swiftlm-runtime/\(wrapperName)"),
            FileManager.default.isExecutableFile(atPath: res.path) {
             return res
         }
-        // Dev fallback: prebuilt llama-runtime/ at repo root, plus the
-        // wrapper from scripts/. We need both — locate the wrapper
-        // (in scripts/) and copy it next to llama-server on first call.
+        // Dev fallback: prebuilt swiftlm-runtime/ at repo root, plus the
+        // wrapper from scripts/. We need both — locate the wrapper (in
+        // scripts/) and copy it next to SwiftLM on first call.
         var dir = Bundle.main.bundleURL.deletingLastPathComponent()
         for _ in 0..<10 {
-            let candidate = dir.appendingPathComponent("llama-runtime/\(wrapperName)")
+            let candidate = dir.appendingPathComponent("swiftlm-runtime/\(wrapperName)")
             if FileManager.default.isExecutableFile(atPath: candidate.path) {
                 return candidate
             }
             // Wrapper not yet copied — copy it from scripts/ if both exist.
             let wrapperSrc = dir.appendingPathComponent("scripts/\(wrapperName)")
-            let runtimeDir = dir.appendingPathComponent("llama-runtime")
+            let runtimeDir = dir.appendingPathComponent("swiftlm-runtime")
             if FileManager.default.isExecutableFile(atPath: wrapperSrc.path),
                FileManager.default.fileExists(atPath: runtimeDir.path) {
                 let dst = runtimeDir.appendingPathComponent(wrapperName)
@@ -297,7 +310,7 @@ final class ModelServer {
         }
         // Last-resort hardcoded dev path.
         let hardcoded = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("workspace/ollama/llama-runtime/\(wrapperName)")
+            .appendingPathComponent("workspace/ollama/swiftlm-runtime/\(wrapperName)")
         if FileManager.default.isExecutableFile(atPath: hardcoded.path) {
             return hardcoded
         }

@@ -1,15 +1,13 @@
 import Foundation
-import CryptoKit
 import os
 
 private let log = Logger(subsystem: "halo.runtime", category: "downloader")
 
 /// Lifecycle of a single model download. Mirrors the design.md §3.8
-/// requirement for resume-on-flaky-wifi + SHA256 integrity.
+/// requirement for resume-on-flaky-wifi + integrity verification.
 enum DownloadState: Equatable, Sendable {
     case idle
     case running(progress: Double, bytesPerSec: Int64)
-    case paused(progress: Double)
     case verifying
     case finished
     case failed(reason: String)
@@ -17,7 +15,6 @@ enum DownloadState: Equatable, Sendable {
     var progress: Double {
         switch self {
         case .running(let p, _): return p
-        case .paused(let p):     return p
         case .verifying:         return 1.0
         case .finished:          return 1.0
         default:                 return 0
@@ -32,20 +29,24 @@ enum DownloadState: Equatable, Sendable {
     }
 }
 
-/// Downloads one GGUF file at a time. Resumable across pause/resume and
-/// across app restarts — the partial file lives at `<dest>.partial` and
-/// the next start sends a `Range: bytes=<size>-` request.
+/// Downloads every file in a HuggingFace MLX repo at a pinned revision
+/// into a local directory. Sequential per-file (network-bound either
+/// way; one big SwiftLM/MLX model is a few large safetensors + a
+/// dozen small JSONs). Resumable: skips files that already exist with
+/// the expected size; partial files are kept across pause/restart.
 ///
-/// Verification: streams the bytes through a CryptoKit SHA256 as we
-/// write, so verifying is free (no second pass over the file). On
-/// mismatch the partial file is deleted to force a clean retry.
+/// Why not per-file SHA256 verification: HF's tree API gives sha256
+/// for LFS files (the big safetensors) but only git-blob sha1 for
+/// non-LFS files. We pin the *revision* (commit SHA) instead, which
+/// is the integrity contract. Per-file LFS sha256 verification is a
+/// future hardening pass; for now we trust HF's TLS + the pinned rev.
 @MainActor
 final class ModelDownloader: NSObject {
     let modelId: String
-    let url: URL
-    let expectedSHA256: String
-    let expectedSize: Int64
-    let destinationURL: URL
+    let huggingfaceRepo: String
+    let huggingfaceRevision: String
+    let expectedTotalBytes: Int64
+    let destinationDirectory: URL
 
     /// Live observable state — the UI binds to this.
     private(set) var state: DownloadState = .idle {
@@ -54,167 +55,216 @@ final class ModelDownloader: NSObject {
     var onStateChange: ((DownloadState) -> Void)?
 
     private var session: URLSession!
-    private var task: URLSessionDataTask?
-    private var fileHandle: FileHandle?
-    private var hasher = SHA256()
-    private var bytesWritten: Int64 = 0
+    private var currentTask: URLSessionDataTask?
+    private var currentFileHandle: FileHandle?
+
+    /// Cumulative bytes across all files in this download (including
+    /// already-present files). Drives the progress fraction.
+    private var totalWrittenBytes: Int64 = 0
     private var sampleAt: Date = .now
     private var sampleBytes: Int64 = 0
+    private var cancelled = false
 
-    init(modelId: String, url: URL, expectedSHA256: String, expectedSize: Int64, destinationURL: URL) {
+    init(
+        modelId: String,
+        huggingfaceRepo: String,
+        huggingfaceRevision: String,
+        expectedTotalBytes: Int64,
+        destinationDirectory: URL
+    ) {
         self.modelId = modelId
-        self.url = url
-        self.expectedSHA256 = expectedSHA256.lowercased()
-        self.expectedSize = expectedSize
-        self.destinationURL = destinationURL
+        self.huggingfaceRepo = huggingfaceRepo
+        self.huggingfaceRevision = huggingfaceRevision
+        self.expectedTotalBytes = expectedTotalBytes
+        self.destinationDirectory = destinationDirectory
         super.init()
 
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 30
-        cfg.timeoutIntervalForResource = 60 * 60 * 24  // 24h — multi-GB on slow wifi is fine
+        cfg.timeoutIntervalForResource = 60 * 60 * 24
         cfg.waitsForConnectivity = true
-        cfg.networkServiceType = .background
-        // Don't let URLCache intercept multi-GB transfers.
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         self.session = URLSession(configuration: cfg, delegate: self, delegateQueue: .main)
     }
 
-    deinit {
-        // task?.cancel()  // can't call on deinit from MainActor
-    }
-
-    var partialURL: URL { destinationURL.appendingPathExtension("partial") }
-
     // MARK: - Public control
 
-    /// Start (or resume) the download. Idempotent — calling while
-    /// already running is a no-op.
+    /// Kick off the download. Idempotent — already-running is a no-op.
     func start() {
-        if case .running = state { return }
-        if case .verifying = state { return }
+        if state.isActive { return }
         if case .finished = state { return }
 
-        // If destination exists, we're done — verify-on-disk and finish.
-        if FileManager.default.fileExists(atPath: destinationURL.path) {
-            Task { await verifyExistingFile() }
-            return
-        }
+        cancelled = false
+        try? FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
 
-        // Resume from .partial if present.
-        let resumeFrom: Int64 = (try? FileHandle(forReadingFrom: partialURL).seekToEnd()).map(Int64.init) ?? 0
-
-        // Open the partial file for append. Create if it doesn't exist.
-        try? FileManager.default.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if !FileManager.default.fileExists(atPath: partialURL.path) {
-            FileManager.default.createFile(atPath: partialURL.path, contents: nil)
-        }
-        do {
-            fileHandle = try FileHandle(forWritingTo: partialURL)
-            try fileHandle?.seekToEnd()
-        } catch {
-            state = .failed(reason: "couldn't open partial file: \(error.localizedDescription)")
-            return
-        }
-
-        // Reset hasher and re-hash already-written bytes if resuming.
-        // For multi-GB resumes this is a real cost — but it's the only
-        // way to verify the final SHA without trusting the partial bytes
-        // blindly. Worth it.
-        hasher = SHA256()
-        bytesWritten = 0
-        if resumeFrom > 0 {
-            log.info("resuming \(self.modelId, privacy: .public) from \(resumeFrom) bytes — rehashing partial")
-            do {
-                let reader = try FileHandle(forReadingFrom: partialURL)
-                while true {
-                    let chunk = try reader.read(upToCount: 256 * 1024)
-                    if let chunk, !chunk.isEmpty {
-                        hasher.update(data: chunk)
-                        bytesWritten += Int64(chunk.count)
-                    } else {
-                        break
-                    }
-                }
-                try reader.close()
-            } catch {
-                log.error("rehash failed: \(error.localizedDescription, privacy: .public) — restarting")
-                hasher = SHA256()
-                bytesWritten = 0
-                try? fileHandle?.truncate(atOffset: 0)
-            }
-        }
-
-        var req = URLRequest(url: url)
-        if bytesWritten > 0 {
-            req.setValue("bytes=\(bytesWritten)-", forHTTPHeaderField: "Range")
-        }
-        sampleAt = .now
-        sampleBytes = bytesWritten
-
-        let t = session.dataTask(with: req)
-        task = t
-        state = .running(progress: progressFraction(), bytesPerSec: 0)
-        t.resume()
+        Task { await self.runDownload() }
     }
 
-    /// Pause the active download. Bytes written so far stay in `.partial`
-    /// — `start()` later will resume.
-    func pause() {
-        guard case .running(let p, _) = state else { return }
-        task?.cancel()
-        task = nil
-        try? fileHandle?.close()
-        fileHandle = nil
-        state = .paused(progress: p)
-    }
-
-    /// Cancel + delete the partial file. Used by Settings → Delete.
-    func cancelAndDelete() {
-        task?.cancel()
-        task = nil
-        try? fileHandle?.close()
-        fileHandle = nil
-        try? FileManager.default.removeItem(at: partialURL)
-        try? FileManager.default.removeItem(at: destinationURL)
-        bytesWritten = 0
-        hasher = SHA256()
+    /// Cancel the in-flight download. Files already written to disk
+    /// stay (start() resumes by skipping them). Use ModelCatalog.
+    /// cancelOrDelete to also wipe the directory.
+    func cancel() {
+        cancelled = true
+        currentTask?.cancel()
+        currentTask = nil
+        try? currentFileHandle?.close()
+        currentFileHandle = nil
+        if !state.isActive { return }
         state = .idle
     }
 
-    // MARK: - Internals
+    // MARK: - Orchestration
 
-    private func progressFraction() -> Double {
-        guard expectedSize > 0 else { return 0 }
-        return min(1.0, Double(bytesWritten) / Double(expectedSize))
-    }
+    private func runDownload() async {
+        state = .running(progress: 0, bytesPerSec: 0)
+        sampleAt = .now
+        sampleBytes = 0
 
-    private func verifyExistingFile() async {
-        state = .verifying
+        // Fetch the file tree at the pinned revision.
+        let files: [HFRepoFile]
         do {
-            let h = try await Task.detached(priority: .userInitiated) { [destinationURL] in
-                try Self.fileSHA256(at: destinationURL)
-            }.value
-            if h == expectedSHA256 {
-                state = .finished
-            } else {
-                try? FileManager.default.removeItem(at: destinationURL)
-                state = .failed(reason: "checksum mismatch on existing file")
-            }
+            files = try await fetchRepoTree()
         } catch {
-            state = .failed(reason: "verify failed: \(error.localizedDescription)")
+            state = .failed(reason: "couldn't list HF tree: \(error.localizedDescription)")
+            return
+        }
+
+        // Skip git-internal files. README is informational; .gitattributes
+        // controls LFS routing on the server side, not relevant locally.
+        let toDownload = files.filter { !$0.path.hasPrefix(".") }
+
+        // Pre-count bytes already on disk so the progress bar starts
+        // accurate when resuming.
+        totalWrittenBytes = toDownload.reduce(into: 0) { acc, f in
+            let dst = destinationDirectory.appendingPathComponent(f.path)
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: dst.path),
+               let size = attrs[.size] as? Int64,
+               size == f.size {
+                acc += size
+            }
+        }
+        emitProgress(force: true)
+
+        for file in toDownload {
+            if cancelled { return }
+            let dst = destinationDirectory.appendingPathComponent(file.path)
+            // Already-correct file? Skip. Wrong-size? Re-download.
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: dst.path),
+               let size = attrs[.size] as? Int64,
+               size == file.size {
+                continue
+            }
+            do {
+                try await downloadFile(file)
+            } catch {
+                if cancelled { return }
+                state = .failed(reason: "\(file.path): \(error.localizedDescription)")
+                return
+            }
+        }
+
+        state = .finished
+        log.info("downloaded \(self.modelId, privacy: .public) (\(self.totalWrittenBytes) bytes)")
+    }
+
+    private func emitProgress(force: Bool = false) {
+        let now = Date()
+        let elapsed = now.timeIntervalSince(sampleAt)
+        guard force || elapsed >= 0.1 else { return }
+        let bytes = totalWrittenBytes - sampleBytes
+        let bps = elapsed > 0 ? Int64(Double(bytes) / elapsed) : 0
+        sampleAt = now
+        sampleBytes = totalWrittenBytes
+        let frac = expectedTotalBytes > 0
+            ? min(1.0, Double(totalWrittenBytes) / Double(expectedTotalBytes))
+            : 0
+        state = .running(progress: frac, bytesPerSec: bps)
+    }
+
+    // MARK: - HF tree
+
+    private struct HFRepoFile: Decodable {
+        let path: String
+        let size: Int64
+        let type: String  // "file" or "directory"
+    }
+
+    private func fetchRepoTree() async throws -> [HFRepoFile] {
+        // HF API: https://huggingface.co/api/models/{repo}/tree/{revision}
+        let urlStr = "https://huggingface.co/api/models/\(huggingfaceRepo)/tree/\(huggingfaceRevision)"
+        guard let url = URL(string: urlStr) else {
+            throw NSError(domain: "halo.downloader", code: -1, userInfo: [NSLocalizedDescriptionKey: "bad URL: \(urlStr)"])
+        }
+        let (data, resp) = try await URLSession.shared.data(from: url)
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            throw NSError(domain: "halo.downloader", code: code, userInfo: [NSLocalizedDescriptionKey: "HF tree HTTP \(code)"])
+        }
+        let all = try JSONDecoder().decode([HFRepoFile].self, from: data)
+        return all.filter { $0.type == "file" }
+    }
+
+    // MARK: - Per-file streaming download
+
+    private func downloadFile(_ file: HFRepoFile) async throws {
+        let dst = destinationDirectory.appendingPathComponent(file.path)
+        // Ensure parent dirs exist (for sharded models with subdirs).
+        try FileManager.default.createDirectory(
+            at: dst.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        // Resume from .partial if present.
+        let partial = dst.appendingPathExtension("partial")
+        let resumeFrom: Int64 = (try? FileHandle(forReadingFrom: partial).seekToEnd()).map(Int64.init) ?? 0
+
+        if !FileManager.default.fileExists(atPath: partial.path) {
+            FileManager.default.createFile(atPath: partial.path, contents: nil)
+        }
+        let handle = try FileHandle(forWritingTo: partial)
+        try handle.seekToEnd()
+        currentFileHandle = handle
+        // Account for resumed bytes in cumulative total.
+        totalWrittenBytes += resumeFrom
+        emitProgress(force: true)
+
+        let resolveURL = "https://huggingface.co/\(huggingfaceRepo)/resolve/\(huggingfaceRevision)/\(file.path)"
+        guard let url = URL(string: resolveURL) else {
+            throw NSError(domain: "halo.downloader", code: -1, userInfo: [NSLocalizedDescriptionKey: "bad resolve URL"])
+        }
+        var req = URLRequest(url: url)
+        if resumeFrom > 0 {
+            req.setValue("bytes=\(resumeFrom)-", forHTTPHeaderField: "Range")
+        }
+
+        // Run the data task and await completion via continuation.
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            let task = session.dataTask(with: req)
+            currentTask = task
+            // Stash the continuation so the delegate methods can fire it.
+            self.currentContinuation = cont
+            self.currentExpectedSize = file.size
+            self.currentResumeBytes = resumeFrom
+            self.currentDestPartial = partial
+            self.currentDestFinal = dst
+            task.resume()
         }
     }
 
-    nonisolated private static func fileSHA256(at url: URL) throws -> String {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        var hasher = SHA256()
-        while true {
-            let chunk = try handle.read(upToCount: 1024 * 1024) ?? Data()
-            if chunk.isEmpty { break }
-            hasher.update(data: chunk)
-        }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    // Per-task scratch state — set in downloadFile, read by delegates.
+    private var currentContinuation: CheckedContinuation<Void, Error>?
+    private var currentExpectedSize: Int64 = 0
+    private var currentResumeBytes: Int64 = 0
+    private var currentDestPartial: URL?
+    private var currentDestFinal: URL?
+
+    private func finishCurrent(_ result: Result<Void, Error>) {
+        currentTask = nil
+        try? currentFileHandle?.close()
+        currentFileHandle = nil
+        let cont = currentContinuation
+        currentContinuation = nil
+        cont?.resume(with: result)
     }
 }
 
@@ -225,22 +275,24 @@ extension ModelDownloader: URLSessionDataDelegate {
                                 dataTask: URLSessionDataTask,
                                 didReceive response: URLResponse,
                                 completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        // Validate response code. 206 = partial content (resume worked),
-        // 200 = full content (server ignored Range — restart from zero).
         if let http = response as? HTTPURLResponse {
             if http.statusCode == 200 {
+                // Server ignored Range header — restart from zero.
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    log.info("server returned 200 (no range support) — restarting from zero")
-                    self.bytesWritten = 0
-                    self.hasher = SHA256()
-                    try? self.fileHandle?.truncate(atOffset: 0)
-                    self.sampleBytes = 0
-                    self.sampleAt = .now
+                    log.info("server returned 200 (no range support) — restarting file from zero")
+                    try? self.currentFileHandle?.truncate(atOffset: 0)
+                    // Roll back the previously-credited resume bytes.
+                    self.totalWrittenBytes -= self.currentResumeBytes
+                    self.currentResumeBytes = 0
                 }
             } else if http.statusCode != 206 && http.statusCode != 200 {
                 Task { @MainActor [weak self] in
-                    self?.state = .failed(reason: "HTTP \(http.statusCode)")
+                    self?.finishCurrent(.failure(NSError(
+                        domain: "halo.downloader",
+                        code: http.statusCode,
+                        userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"]
+                    )))
                 }
                 completionHandler(.cancel)
                 return
@@ -253,28 +305,16 @@ extension ModelDownloader: URLSessionDataDelegate {
                                 dataTask: URLSessionDataTask,
                                 didReceive data: Data) {
         Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self, !self.cancelled else { return }
             do {
-                try self.fileHandle?.write(contentsOf: data)
-                self.hasher.update(data: data)
-                self.bytesWritten += Int64(data.count)
+                try self.currentFileHandle?.write(contentsOf: data)
             } catch {
-                log.error("write failed: \(error.localizedDescription, privacy: .public)")
-                self.task?.cancel()
-                self.state = .failed(reason: "disk write: \(error.localizedDescription)")
+                self.currentTask?.cancel()
+                self.finishCurrent(.failure(error))
                 return
             }
-
-            // Throttle UI updates to ~10/s so SwiftUI isn't overwhelmed.
-            let now = Date()
-            let elapsed = now.timeIntervalSince(self.sampleAt)
-            if elapsed >= 0.1 {
-                let bytes = self.bytesWritten - self.sampleBytes
-                let bps = Int64(Double(bytes) / elapsed)
-                self.sampleAt = now
-                self.sampleBytes = self.bytesWritten
-                self.state = .running(progress: self.progressFraction(), bytesPerSec: bps)
-            }
+            self.totalWrittenBytes += Int64(data.count)
+            self.emitProgress()
         }
     }
 
@@ -283,37 +323,29 @@ extension ModelDownloader: URLSessionDataDelegate {
                                 didCompleteWithError error: Error?) {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            try? self.fileHandle?.close()
-            self.fileHandle = nil
+            try? self.currentFileHandle?.close()
+            self.currentFileHandle = nil
 
             if let error = error as NSError? {
-                // Cancel from pause()/cancelAndDelete() is a normal exit —
-                // state is already correct.
+                if error.code == NSURLErrorCancelled && self.cancelled { return }
                 if error.code == NSURLErrorCancelled { return }
-                log.error("download failed: \(error.localizedDescription, privacy: .public)")
-                self.state = .failed(reason: error.localizedDescription)
+                self.finishCurrent(.failure(error))
                 return
             }
 
-            // All bytes received — verify SHA matches.
-            self.state = .verifying
-            let actual = self.hasher.finalize().map { String(format: "%02x", $0) }.joined()
-            if actual == self.expectedSHA256 {
-                // Move .partial → final destination.
+            // Atomic rename .partial → final destination.
+            if let partial = self.currentDestPartial, let dst = self.currentDestFinal {
                 do {
-                    if FileManager.default.fileExists(atPath: self.destinationURL.path) {
-                        try FileManager.default.removeItem(at: self.destinationURL)
+                    if FileManager.default.fileExists(atPath: dst.path) {
+                        try FileManager.default.removeItem(at: dst)
                     }
-                    try FileManager.default.moveItem(at: self.partialURL, to: self.destinationURL)
-                    self.state = .finished
+                    try FileManager.default.moveItem(at: partial, to: dst)
                 } catch {
-                    self.state = .failed(reason: "rename failed: \(error.localizedDescription)")
+                    self.finishCurrent(.failure(error))
+                    return
                 }
-            } else {
-                log.error("checksum mismatch — expected \(self.expectedSHA256, privacy: .public), got \(actual, privacy: .public)")
-                try? FileManager.default.removeItem(at: self.partialURL)
-                self.state = .failed(reason: "checksum mismatch")
             }
+            self.finishCurrent(.success(()))
         }
     }
 }

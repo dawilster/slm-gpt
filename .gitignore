@@ -8,9 +8,9 @@ __pycache__/
 # Compiled by scripts/build-runtime.sh — bundled into the Mac app at build time.
 /halo-runtime
 
-# Fetched by scripts/build-llama-server.sh — official llama.cpp prebuilt
-# bundled into the Mac app's Resources/llama-runtime/.
-/llama-runtime/
+# Fetched by scripts/fetch-swiftlm.sh — SwiftLM binary + mlx.metallib
+# bundled into the Mac app's Resources/swiftlm-runtime/.
+/swiftlm-runtime/
 /vendor/
 
 # Bun build transients

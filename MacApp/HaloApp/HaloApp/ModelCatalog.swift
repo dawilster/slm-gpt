@@ -11,12 +11,22 @@ struct CatalogModel: Decodable, Sendable {
     let tagline: String
     let params: String
     let quant: String
-    let sizeBytes: Int64
+    let sizeBytes: Int64        // sum of every file in the HF repo
     let ramRequiredMB: Int
     let context: Int
-    let url: String
-    let sha256: String
+    /// HuggingFace repo id (e.g. "mlx-community/Qwen3.5-2B-6bit").
+    /// We download every file in this repo at the pinned revision into
+    /// our local models dir, then point SwiftLM at that directory.
+    let huggingfaceRepo: String
+    /// Pinned commit SHA. "main" is permitted but defeats the
+    /// vetting promise — bumping a model = re-pinning to a real SHA.
+    let huggingfaceRevision: String
     let minRamGB: Int
+    /// True for VLM (vision-language) models — Qwen3.5-2B-6bit on
+    /// mlx-community is multimodal, with weights namespaced under
+    /// `language_model.*` rather than `model.*`. SwiftLM needs the
+    /// `--vision` flag to load these correctly. Defaults to false.
+    let isVisionModel: Bool?
 }
 
 private struct CatalogManifest: Decodable {
@@ -100,6 +110,13 @@ final class ModelCatalog {
         }
     }
 
+    /// True if the entry id exists in the current catalog. Cheap helper
+    /// used by AppDelegate to validate a persisted selectedModelId
+    /// against catalog drift (entry removed across app upgrades).
+    func has(id: String) -> Bool {
+        entries.contains(where: { $0.id == id })
+    }
+
     private func installedCount() -> Int {
         entries.filter { if case .installed = $0.availability { return true } else { return false } }.count
     }
@@ -111,34 +128,28 @@ final class ModelCatalog {
     }
 
     private func installedURL(for model: CatalogModel) -> URL {
-        modelsDirectory.appendingPathComponent("\(model.id).gguf")
+        // MLX models are *directories* (config.json + tokenizer.json +
+        // model.safetensors* + ...), not single files. We mirror the
+        // HF repo structure under <id>/ for clarity.
+        modelsDirectory.appendingPathComponent(model.id, isDirectory: true)
     }
 
     private func computeAvailability(for model: CatalogModel, at dest: URL) -> EntryAvailability {
         if model.minRamGB > SystemInfo.totalRAMGB {
             return .ramBlocked(model.minRamGB)
         }
-        if FileManager.default.fileExists(atPath: dest.path) {
-            // Trust on-disk presence + correct size as a proxy for installed.
-            // A full SHA verify happens lazily on first ModelDownloader.start()
-            // touching this entry — too expensive to do up front.
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: dest.path),
-               let size = attrs[.size] as? Int64,
-               size == model.sizeBytes {
-                return .installed
-            }
-            // Wrong size = corrupt. Treat as available; downloader will overwrite.
-            log.error("on-disk size mismatch for \(model.id, privacy: .public) — treating as available")
-            try? FileManager.default.removeItem(at: dest)
+        // An installed MLX model needs at minimum: config.json,
+        // tokenizer.json, and a safetensors file. If those are present
+        // we trust it; per-file verification happens on download.
+        let requiredFiles = ["config.json", "tokenizer.json"]
+        let allRequired = requiredFiles.allSatisfy {
+            FileManager.default.fileExists(atPath: dest.appendingPathComponent($0).path)
         }
-        // Look for a partial download from a prior session.
-        let partial = dest.appendingPathExtension("partial")
-        if FileManager.default.fileExists(atPath: partial.path) {
-            // We could probe the size and report "paused at X%", but
-            // exposing that as a pre-bound downloader requires the user
-            // to hit Resume to actually attach. Treat as available; the
-            // downloader's start() handles resume.
-            return .available
+        // safetensors may be sharded — accept any file matching .safetensors
+        let hasSafetensors = (try? FileManager.default.contentsOfDirectory(atPath: dest.path))?
+            .contains(where: { $0.hasSuffix(".safetensors") }) ?? false
+        if allRequired && hasSafetensors {
+            return .installed
         }
         return .available
     }
@@ -146,21 +157,18 @@ final class ModelCatalog {
     // MARK: - Public actions
 
     /// Begin (or resume) downloading a model. Wires up a ModelDownloader
-    /// and pushes availability to `.downloading` until it finishes.
+    /// for the HF repo at the pinned revision, downloading every file
+    /// into the entry's directory.
     func startDownload(for entryId: String) {
         guard let entry = entries.first(where: { $0.id == entryId }) else { return }
 
         if entry.downloader == nil {
-            guard let url = URL(string: entry.model.url) else {
-                log.error("invalid url for \(entryId, privacy: .public)")
-                return
-            }
             let dl = ModelDownloader(
                 modelId: entry.id,
-                url: url,
-                expectedSHA256: entry.model.sha256,
-                expectedSize: entry.model.sizeBytes,
-                destinationURL: entry.installedURL
+                huggingfaceRepo: entry.model.huggingfaceRepo,
+                huggingfaceRevision: entry.model.huggingfaceRevision,
+                expectedTotalBytes: entry.model.sizeBytes,
+                destinationDirectory: entry.installedURL
             )
             dl.onStateChange = { [weak self, weak entry] state in
                 guard let self, let entry else { return }
@@ -172,21 +180,13 @@ final class ModelCatalog {
         entry.downloader?.start()
     }
 
-    func pauseDownload(for entryId: String) {
-        entries.first(where: { $0.id == entryId })?.downloader?.pause()
-    }
-
-    /// Cancel an in-progress download or delete an installed model. The
-    /// downloader handles both cases (it deletes the partial AND the
-    /// final file).
+    /// Cancel an in-progress download or delete an installed model.
+    /// MLX models live in a directory, so we recursively remove the
+    /// whole tree (deletes both completed files and any partials).
     func cancelOrDelete(_ entryId: String) {
         guard let entry = entries.first(where: { $0.id == entryId }) else { return }
-        if let dl = entry.downloader {
-            dl.cancelAndDelete()
-        } else {
-            try? FileManager.default.removeItem(at: entry.installedURL)
-            try? FileManager.default.removeItem(at: entry.installedURL.appendingPathExtension("partial"))
-        }
+        entry.downloader?.cancel()
+        try? FileManager.default.removeItem(at: entry.installedURL)
         entry.downloader = nil
         entry.availability = computeAvailability(for: entry.model, at: entry.installedURL)
     }
@@ -198,7 +198,7 @@ final class ModelCatalog {
             log.info("\(entry.id, privacy: .public) installed")
         case .failed:
             entry.availability = computeAvailability(for: entry.model, at: entry.installedURL)
-        case .running, .verifying, .paused:
+        case .running, .verifying:
             entry.availability = .downloading
         case .idle:
             entry.availability = computeAvailability(for: entry.model, at: entry.installedURL)

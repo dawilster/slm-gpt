@@ -56,7 +56,7 @@
 				3DF8491B2FA35C2B0035330F /* Frameworks */,
 				3DF8491C2FA35C2B0035330F /* Resources */,
 				D0E1D0E1D0E1D0E1D0E1D0E1 /* Bundle halo-runtime */,
-				D0E2D0E2D0E2D0E2D0E2D0E2 /* Bundle llama-runtime */,
+				D0E2D0E2D0E2D0E2D0E2D0E2 /* Bundle swiftlm-runtime */,
 			);
 			buildRules = (
 			);
@@ -137,7 +137,7 @@
 			shellPath = /bin/sh;
 			shellScript = "set -e\nREPO=\"$SRCROOT/../..\"\nif [ ! -f \"$REPO/scripts/build-runtime.sh\" ]; then\n  echo \"error: $REPO/scripts/build-runtime.sh not found\" >&2\n  exit 1\nfi\n\"$REPO/scripts/build-runtime.sh\"\nDEST=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\nmkdir -p \"$DEST\"\ncp \"$REPO/halo-runtime\" \"$DEST/halo-runtime\"\nchmod +x \"$DEST/halo-runtime\"\n";
 		};
-		D0E2D0E2D0E2D0E2D0E2D0E2 /* Bundle llama-runtime */ = {
+		D0E2D0E2D0E2D0E2D0E2D0E2 /* Bundle swiftlm-runtime */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
@@ -147,15 +147,15 @@
 			);
 			inputPaths = (
 			);
-			name = "Bundle llama-runtime";
+			name = "Bundle swiftlm-runtime";
 			outputFileListPaths = (
 			);
 			outputPaths = (
-				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/llama-runtime/llama-server",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/swiftlm-runtime/SwiftLM",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -e\nREPO=\"$SRCROOT/../..\"\nif [ ! -f \"$REPO/scripts/build-llama-server.sh\" ]; then\n  echo \"error: $REPO/scripts/build-llama-server.sh not found\" >&2\n  exit 1\nfi\n\"$REPO/scripts/build-llama-server.sh\"\nSRC=\"$REPO/llama-runtime\"\nDEST=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/llama-runtime\"\nmkdir -p \"$DEST\"\n# Copy binary + dylibs (rpath = @loader_path so they must sit\n# alongside llama-server). ditto overwrites in place and preserves\n# symlinks for the libfoo.0.dylib -> libfoo.0.X.Y.dylib chain.\nditto \"$SRC/llama-server\" \"$DEST/llama-server\"\nchmod +x \"$DEST/llama-server\"\nfor dylib in \"$SRC\"/lib*.dylib; do\n  ditto \"$dylib\" \"$DEST/$(basename \"$dylib\")\"\ndone\n# Death-pact wrapper — the script ModelServer.swift actually spawns.\n# Polls the Mac app's pid and SIGKILLs llama-server when parent dies\n# (force-kill, crash). Without this llama-server orphans to launchd\n# holding ~3GB of RAM with the GGUF mmap'd.\nditto \"$REPO/scripts/llama-server-supervised.sh\" \"$DEST/llama-server-supervised.sh\"\nchmod +x \"$DEST/llama-server-supervised.sh\"\n";
+			shellScript = "set -e\nREPO=\"$SRCROOT/../..\"\nif [ ! -f \"$REPO/scripts/fetch-swiftlm.sh\" ]; then\n  echo \"error: $REPO/scripts/fetch-swiftlm.sh not found\" >&2\n  exit 1\nfi\n\"$REPO/scripts/fetch-swiftlm.sh\"\nSRC=\"$REPO/swiftlm-runtime\"\nDEST=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/swiftlm-runtime\"\nmkdir -p \"$DEST\"\n# Copy SwiftLM binary + mlx.metallib (~190MB total).\nditto \"$SRC/SwiftLM\" \"$DEST/SwiftLM\"\nchmod +x \"$DEST/SwiftLM\"\nditto \"$SRC/mlx.metallib\" \"$DEST/mlx.metallib\"\n# Death-pact wrapper — same pattern as halo-runtime. Polls the Mac\n# app's pid and SIGKILLs SwiftLM when parent dies. Without this a\n# force-killed app leaves SwiftLM holding the model in memory.\nditto \"$REPO/scripts/swiftlm-supervised.sh\" \"$DEST/swiftlm-supervised.sh\"\nchmod +x \"$DEST/swiftlm-supervised.sh\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

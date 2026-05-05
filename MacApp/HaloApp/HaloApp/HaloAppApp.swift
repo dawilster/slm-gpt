@@ -1,5 +1,8 @@
 import SwiftUI
 import AppKit
+import os
+
+private let log = Logger(subsystem: "halo.runtime", category: "appdelegate")
 
 @main
 struct HaloAppApp: App {
@@ -156,13 +159,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Inference stack orchestration
 
     /// Boot the inference stack in the right order based on current
-    /// endpoint mode. In bundled mode we wait for llama-server's health
-    /// before starting the harness — otherwise the harness's first
-    /// model-discovery probe races the model load and reports offline.
+    /// endpoint mode. In bundled mode we start ModelServer first and
+    /// wait for it to be healthy before starting the harness; if no
+    /// usable model is available, we fall back to external mode for
+    /// this boot rather than cascade-failing the whole stack.
     private func bootInferenceStack() async {
         switch AppState.shared.endpointMode {
         case .bundled:
-            await startBundledModelIfPossible()
+            let started = await startBundledModelIfPossible()
+            if !started {
+                // Nothing playable for bundled mode. Inject a one-shot
+                // MODEL_BASE_URL pointing at the user's external endpoint
+                // so the harness still boots and the user can use the
+                // app while they go fix their bundled-model setup.
+                RuntimeServer.shared.nextSpawnURLOverride =
+                    AppState.shared.externalEndpointURL.isEmpty
+                        ? AppState.defaultExternalEndpoint
+                        : AppState.shared.externalEndpointURL
+                log.info("bundled boot fell back to external — no usable model installed")
+            }
             await RuntimeServer.shared.start()
         case .external:
             // No model server to manage — harness talks straight to the
@@ -171,14 +186,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Pick a model and start llama-server. Falls back to first
-    /// installed entry if the user hasn't picked one (a fresh-install
-    /// state: bundled mode selected in onboarding, no explicit pick).
-    /// If nothing is installed, we leave llama-server stopped — the UI
-    /// surfaces the empty state.
-    private func startBundledModelIfPossible() async {
+    /// Pick a model and start ModelServer. Returns true if it spawned
+    /// (or was already running), false if there's nothing installable
+    /// to load — caller decides what to do (typically: boot the harness
+    /// in external-fallback mode and let the UI surface the gap).
+    @discardableResult
+    private func startBundledModelIfPossible() async -> Bool {
         let catalog = ModelCatalog.shared
-        let modelId: String? = AppState.shared.selectedModelId
+        // Prefer the user's selected model — but only if it still
+        // exists in the current catalog (defensive against catalog
+        // drift across app upgrades).
+        let stable: String? = AppState.shared.selectedModelId.flatMap {
+            catalog.has(id: $0) ? $0 : nil
+        }
+        let modelId: String? = stable
             ?? catalog.entries.first(where: {
                 if case .installed = $0.availability { return true }
                 return false
@@ -186,9 +207,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard let modelId else {
             ModelServer.shared.onStateChange?(.crashed(reason: "no installed model"))
-            return
+            return false
         }
         await ModelServer.shared.start(modelId: modelId)
+        return true
     }
 
     /// User flipped the endpoint mode (or hit Apply on a new URL).

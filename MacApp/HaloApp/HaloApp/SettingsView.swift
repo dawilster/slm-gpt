@@ -291,9 +291,6 @@ private struct CatalogModelRow: View {
                     .font(.haloUI(10.5))
                     .foregroundStyle(Color.haloWarn)
                     .padding(.top, 4)
-            } else if let dl = entry.downloader, case .paused(let p) = dl.state {
-                progressStrip(progress: p, bps: 0, label: "Paused")
-                    .padding(.top, 8)
             }
         }
         .padding(.horizontal, 8).padding(.vertical, 12)
@@ -334,29 +331,15 @@ private struct CatalogModelRow: View {
             }
             .buttonStyle(.plain)
         case .downloading:
-            HStack(spacing: 6) {
-                if let dl = entry.downloader, case .running = dl.state {
-                    Button(action: { ModelCatalog.shared.pauseDownload(for: entry.id) }) {
-                        Text("Pause")
-                            .font(.haloUI(10.5))
-                            .foregroundStyle(Color.haloFgDim)
-                    }
-                    .buttonStyle(.plain)
-                } else if let dl = entry.downloader, case .paused = dl.state {
-                    Button(action: { ModelCatalog.shared.startDownload(for: entry.id) }) {
-                        Text("Resume")
-                            .font(.haloUI(10.5))
-                            .foregroundStyle(Color.haloAccent)
-                    }
-                    .buttonStyle(.plain)
-                }
-                Button(action: { ModelCatalog.shared.cancelOrDelete(entry.id) }) {
-                    Text("Cancel")
-                        .font(.haloUI(10.5))
-                        .foregroundStyle(Color.haloFgDim)
-                }
-                .buttonStyle(.plain)
+            // Cancel-only — pause is intentionally not exposed for the
+            // multi-file MLX downloader. Cancelling leaves already-
+            // downloaded files on disk; clicking Download again resumes.
+            Button(action: { ModelCatalog.shared.cancelOrDelete(entry.id) }) {
+                Text("Cancel")
+                    .font(.haloUI(10.5))
+                    .foregroundStyle(Color.haloFgDim)
             }
+            .buttonStyle(.plain)
         case .installed:
             HStack(spacing: 8) {
                 HStack(spacing: 4) {

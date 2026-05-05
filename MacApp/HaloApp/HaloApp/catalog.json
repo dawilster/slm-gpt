@@ -1,45 +1,32 @@
 {
-  "$comment": "Vetted local model catalog. Each entry has a pinned SHA256 — the 'vetting' is that we picked these GGUFs, tested them on our reference hardware, and pinned the exact bytes. New models = new app release. See design.md §3.8.",
-  "version": 1,
+  "$comment": "Vetted MLX model catalog. Each entry pins a HuggingFace repo + revision (commit SHA) — the 'vetting' is that we picked these models, tested them on our reference hardware, and pinned the exact repo state. New revisions = new app release. See design.md §3.8. Note: Qwen3.5-2B-6bit on mlx-community is the VLM variant and SwiftLM b644's vision-tower expectations don't match its packaging — dropped until SwiftLM catches up or a non-VLM Qwen3.5-2B is published.",
+  "version": 2,
   "models": [
     {
-      "id": "qwen2.5-1.5b-instruct-q4km",
-      "name": "Qwen 2.5 · 1.5B Instruct",
-      "tagline": "Smallest viable. Fast on any 8GB Mac.",
-      "params": "1.5B",
-      "quant": "Q4_K_M",
-      "sizeBytes": 986048768,
-      "ramRequiredMB": 2200,
-      "context": 32768,
-      "url": "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
-      "sha256": "1adf0b11065d8ad2e8123ea110d1ec956dab4ab038eab665614adba04b6c3370",
-      "minRamGB": 8
-    },
-    {
-      "id": "qwen3-1.7b-q4km",
-      "name": "Qwen 3 · 1.7B",
-      "tagline": "Recommended. Tool calling that fits comfortably on 8GB.",
+      "id": "qwen3-1.7b-6bit",
+      "name": "Qwen 3 · 1.7B (6-bit MLX)",
+      "tagline": "Recommended. Sharp tool calling, fits 8GB comfortably.",
       "params": "1.7B",
-      "quant": "Q4_K_M",
-      "sizeBytes": 1107409472,
-      "ramRequiredMB": 2400,
+      "quant": "6-bit",
       "context": 32768,
-      "url": "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf",
-      "sha256": "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897",
+      "huggingfaceRepo": "mlx-community/Qwen3-1.7B-6bit",
+      "huggingfaceRevision": "main",
+      "sizeBytes": 1414129059,
+      "ramRequiredMB": 2100,
       "minRamGB": 8
     },
     {
-      "id": "qwen2.5-7b-instruct-q4km",
-      "name": "Qwen 2.5 · 7B Instruct",
-      "tagline": "Higher quality. Needs 16GB+.",
-      "params": "7B",
-      "quant": "Q4_K_M",
-      "sizeBytes": 4683074240,
-      "ramRequiredMB": 7500,
+      "id": "qwen3-1.7b-4bit",
+      "name": "Qwen 3 · 1.7B (4-bit MLX)",
+      "tagline": "Smallest. Fastest on any 8GB Mac.",
+      "params": "1.7B",
+      "quant": "4-bit",
       "context": 32768,
-      "url": "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
-      "sha256": "65b8fcd92af6b4fefa935c625d1ac27ea29dcb6ee14589c55a8f115ceaaa1423",
-      "minRamGB": 16
+      "huggingfaceRepo": "mlx-community/Qwen3-1.7B-4bit",
+      "huggingfaceRevision": "main",
+      "sizeBytes": 984015687,
+      "ramRequiredMB": 1500,
+      "minRamGB": 8
     }
   ]
 }
