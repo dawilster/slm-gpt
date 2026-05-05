@@ -86,14 +86,18 @@ struct MenubarPanelView: View {
     private var heroBlock: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
-                HaloOrb(size: 26, state: state.menubarState)
+                HaloOrb(size: 26, state: state.modelStatus.kind)
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Milo")
                         .font(.haloUI(13, weight: .semibold))
                         .tracking(-0.13)
-                    Text("Ready · Local")
+                    // "<headline> · Local" / "<headline> · External" so
+                    // the user always sees both: what's happening, and
+                    // whether it's bundled vs their own endpoint.
+                    Text("\(state.modelStatus.headline) · \(state.endpointMode == .bundled ? "Local" : "External")")
                         .font(.haloUI(11))
                         .foregroundStyle(Color.haloFgDim)
+                        .lineLimit(1).truncationMode(.tail)
                 }
                 Spacer(minLength: 0)
                 Button(action: {

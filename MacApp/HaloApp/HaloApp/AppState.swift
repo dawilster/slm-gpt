@@ -1,7 +1,23 @@
 import SwiftUI
 
 enum HaloMenubarState: String, Equatable {
-    case offline, idle, listening, thinking, loading
+    case offline, idle, listening, thinking, loading, error
+}
+
+/// A single, derived view of "what is the model doing right now". Used
+/// by every status surface (menubar glyph, menubar panel hero, dock
+/// ready strip) so they all agree. Built from `modelServerState`
+/// (process lifecycle), `runtimeStatus` (harness HTTP health), and
+/// `chat.status` (in-flight turn) — the three signals that, together,
+/// describe the real state from the user's perspective.
+struct ModelStatusSummary: Equatable {
+    /// Glyph state for the menubar mark + dot color.
+    let kind: HaloMenubarState
+    /// Short headline ("Ready", "Loading qwen3.5-2b…", "Model crashed").
+    let headline: String
+    /// Optional second line of detail (e.g. crash reason). Nil keeps
+    /// the UI to one line.
+    let detail: String?
 }
 
 /// Where the brain (halo-runtime) gets its model from.
@@ -190,5 +206,59 @@ final class AppState {
         case .bundled:  return AppState.bundledModelBaseURL
         case .external: return externalEndpointURL.isEmpty ? AppState.defaultExternalEndpoint : externalEndpointURL
         }
+    }
+
+    /// Single source of truth for "what's the model doing". Every
+    /// status surface (menubar glyph, menubar panel hero, dock strip)
+    /// reads this so they can never disagree.
+    ///
+    /// Priority order — what we'd say to the user, ranked by
+    /// "would the user want to know this most?":
+    ///   1. Crash    (something broke; the user needs to know now)
+    ///   2. Loading  (in transition; explains why chat isn't ready)
+    ///   3. Offline  (harness is down)
+    ///   4. Thinking (chat turn in flight)
+    ///   5. Ready    (everything is up)
+    var modelStatus: ModelStatusSummary {
+        // 1. Crash trumps everything — the user can't use anything,
+        //    they need the failure surfaced.
+        if case .crashed(let why) = modelServerState, endpointMode == .bundled {
+            return ModelStatusSummary(kind: .error, headline: "Model unavailable", detail: why)
+        }
+
+        // 2. Mid-load — model server is spawning or loading weights.
+        //    "Loading <id>…" so the user knows what's happening.
+        if case .starting(let id) = modelServerState, endpointMode == .bundled {
+            return ModelStatusSummary(kind: .loading, headline: "Loading \(id)…", detail: nil)
+        }
+
+        // 3. Harness is down (no /v1/health response). Distinct from
+        //    "no model selected yet" — that's not an error, it just
+        //    means there's nothing to do until the user picks one.
+        if !runtimeStatus.connected {
+            // Bundled mode + nothing running = boot-in-progress
+            // rather than a real fault. Silent during the first
+            // ~second so the menubar doesn't flash "offline" before
+            // the harness binds the port.
+            if endpointMode == .bundled,
+               case .notStarted = modelServerState {
+                return ModelStatusSummary(kind: .loading, headline: "Starting…", detail: nil)
+            }
+            return ModelStatusSummary(
+                kind: .offline,
+                headline: "Offline",
+                detail: endpointMode == .external
+                    ? "Endpoint \(externalEndpointURL) unreachable"
+                    : "Runtime not responding"
+            )
+        }
+
+        // 4. Chat in flight — generation is happening.
+        if chat.status == .thinking {
+            return ModelStatusSummary(kind: .thinking, headline: "Thinking…", detail: nil)
+        }
+
+        // 5. Default — everything up, idle.
+        return ModelStatusSummary(kind: .idle, headline: "Ready", detail: nil)
     }
 }

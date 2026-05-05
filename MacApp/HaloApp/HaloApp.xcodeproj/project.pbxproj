@@ -56,7 +56,7 @@
 				3DF8491B2FA35C2B0035330F /* Frameworks */,
 				3DF8491C2FA35C2B0035330F /* Resources */,
 				D0E1D0E1D0E1D0E1D0E1D0E1 /* Bundle halo-runtime */,
-				D0E2D0E2D0E2D0E2D0E2D0E2 /* Bundle swiftlm-runtime */,
+				D0E2D0E2D0E2D0E2D0E2D0E2 /* Bundle python-runtime */,
 			);
 			buildRules = (
 			);
@@ -135,9 +135,9 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -e\nREPO=\"$SRCROOT/../..\"\nif [ ! -f \"$REPO/scripts/build-runtime.sh\" ]; then\n  echo \"error: $REPO/scripts/build-runtime.sh not found\" >&2\n  exit 1\nfi\n\"$REPO/scripts/build-runtime.sh\"\nDEST=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\nmkdir -p \"$DEST\"\ncp \"$REPO/halo-runtime\" \"$DEST/halo-runtime\"\nchmod +x \"$DEST/halo-runtime\"\n";
+			shellScript = "set -e\nREPO=\"$SRCROOT/../..\"\nif [ ! -f \"$REPO/scripts/build-runtime.sh\" ]; then\n  echo \"error: $REPO/scripts/build-runtime.sh not found\" >&2\n  exit 1\nfi\n# Idempotent — only rebuilds if src/ changed. Important: rebuilding\n# halo-runtime always produces a different hash even from identical\n# source, which invalidates the .app's resource seal and gets the\n# binary SIGKILLed on next launch.\n\"$REPO/scripts/build-runtime.sh\"\nDEST=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\nmkdir -p \"$DEST\"\n# Only copy if source is newer than destination — otherwise even an\n# idempotent build_runtime.sh exit still updates destination mtime\n# (cp's default), which keeps confusing Xcode's incremental build into\n# a re-sign-vs-not race. `-nt` is `[file1] is newer than [file2]`.\nif [ ! -f \"$DEST/halo-runtime\" ] || [ \"$REPO/halo-runtime\" -nt \"$DEST/halo-runtime\" ]; then\n  cp \"$REPO/halo-runtime\" \"$DEST/halo-runtime\"\n  chmod +x \"$DEST/halo-runtime\"\nfi\n";
 		};
-		D0E2D0E2D0E2D0E2D0E2D0E2 /* Bundle swiftlm-runtime */ = {
+		D0E2D0E2D0E2D0E2D0E2D0E2 /* Bundle python-runtime */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
@@ -147,15 +147,15 @@
 			);
 			inputPaths = (
 			);
-			name = "Bundle swiftlm-runtime";
+			name = "Bundle python-runtime";
 			outputFileListPaths = (
 			);
 			outputPaths = (
-				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/swiftlm-runtime/SwiftLM",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/python-runtime/bin/python3",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -e\nREPO=\"$SRCROOT/../..\"\nif [ ! -f \"$REPO/scripts/fetch-swiftlm.sh\" ]; then\n  echo \"error: $REPO/scripts/fetch-swiftlm.sh not found\" >&2\n  exit 1\nfi\n\"$REPO/scripts/fetch-swiftlm.sh\"\nSRC=\"$REPO/swiftlm-runtime\"\nDEST=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/swiftlm-runtime\"\nmkdir -p \"$DEST\"\n# Copy SwiftLM binary + mlx.metallib (~190MB total).\nditto \"$SRC/SwiftLM\" \"$DEST/SwiftLM\"\nchmod +x \"$DEST/SwiftLM\"\nditto \"$SRC/mlx.metallib\" \"$DEST/mlx.metallib\"\n# Death-pact wrapper — same pattern as halo-runtime. Polls the Mac\n# app's pid and SIGKILLs SwiftLM when parent dies. Without this a\n# force-killed app leaves SwiftLM holding the model in memory.\nditto \"$REPO/scripts/swiftlm-supervised.sh\" \"$DEST/swiftlm-supervised.sh\"\nchmod +x \"$DEST/swiftlm-supervised.sh\"\n";
+			shellScript = "set -e\nREPO=\"$SRCROOT/../..\"\nif [ ! -f \"$REPO/scripts/fetch-python-mlx.sh\" ]; then\n  echo \"error: $REPO/scripts/fetch-python-mlx.sh not found\" >&2\n  exit 1\nfi\n# Idempotent — only re-fetches Python + pip-installs if missing.\n\"$REPO/scripts/fetch-python-mlx.sh\"\nSRC=\"$REPO/python-runtime\"\nDEST=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/python-runtime\"\n# Clean before ditto — `ditto` is sync-like, not exact-mirror: files\n# present in DEST but not in SRC are *not* removed. Without this rm,\n# old deps (torch, cv2, etc.) linger across rebuilds and the bundled\n# python-runtime grows monotonically over each build cycle.\nrm -rf \"$DEST\"\nmkdir -p \"$DEST\"\n# ditto preserves symlinks and resource forks — important for the\n# python-build-standalone tarball which uses symlinks (bin/python3\n# -> python3.11) and ships .dylibs that need to keep their layout.\nditto \"$SRC\" \"$DEST\"\n# Belt-and-braces: re-copy the source-controlled wrapper from\n# scripts/ in case fetch-python-mlx.sh's copy was stale (e.g. the\n# user edited python-supervised.sh between fetches).\nditto \"$REPO/scripts/python-supervised.sh\" \"$DEST/python-supervised.sh\"\nchmod +x \"$DEST/python-supervised.sh\"\nditto \"$REPO/scripts/serve.py\" \"$DEST/serve.py\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

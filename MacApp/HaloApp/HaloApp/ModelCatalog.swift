@@ -22,11 +22,9 @@ struct CatalogModel: Decodable, Sendable {
     /// vetting promise — bumping a model = re-pinning to a real SHA.
     let huggingfaceRevision: String
     let minRamGB: Int
-    /// True for VLM (vision-language) models — Qwen3.5-2B-6bit on
-    /// mlx-community is multimodal, with weights namespaced under
-    /// `language_model.*` rather than `model.*`. SwiftLM needs the
-    /// `--vision` flag to load these correctly. Defaults to false.
-    let isVisionModel: Bool?
+    // No isVisionModel field: serve.py auto-detects VLMs by
+    // inspecting the model's config.json for a `vision_config` block,
+    // so the catalog stays free of redundant-flag-vs-config drift.
 }
 
 private struct CatalogManifest: Decodable {

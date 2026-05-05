@@ -34,6 +34,28 @@ fi
 TARGET="bun-darwin-arm64"
 OUT="halo-runtime"
 
+# Skip rebuild if every source file is older than the existing output.
+# This makes the script idempotent — Xcode runs it on every build (the
+# build phase is `alwaysOutOfDate=1` because we can't enumerate every
+# transitive `import` for proper input-tracking), but rebuilding when
+# nothing changed still produces a freshly-compiled binary with a
+# different hash, which invalidates the .app's resource seal and gets
+# halo-runtime SIGKILLed by macOS on next launch. Idempotency here
+# means incremental Xcode builds don't trigger that cycle.
+#
+# `--force` opts back into unconditional rebuild for CI / release.
+FORCE=0
+[ "${1:-}" = "--force" ] && FORCE=1
+
+if [ "$FORCE" = "0" ] && [ -x "$OUT" ]; then
+  # `find` exits 0 if anything matched; -newer is mtime comparison.
+  # We compare every .ts under src/ + the build script itself + bun.lock.
+  if [ -z "$(find src/ scripts/build-runtime.sh bun.lock 2>/dev/null -newer "$OUT" -print -quit)" ]; then
+    echo "✓ $OUT up-to-date ($(du -h "$OUT" | cut -f1)) — pass --force to rebuild"
+    exit 0
+  fi
+fi
+
 echo "→ bun build --compile --target=$TARGET src/server.ts → $OUT"
 bun build \
   --compile \

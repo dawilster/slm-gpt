@@ -215,14 +215,12 @@ final class StatusBarController: NSObject, NSWindowDelegate {
 
     // MARK: - Icon
 
-    /// Combine connectivity, chat status, and explicit menubar state into a
-    /// single glyph state. Offline trumps everything else — the runtime
-    /// being down is the most important fact at a glance — followed by an
-    /// in-flight chat turn, then any caller-set state.
+    /// Glyph state — defers to the centralized `modelStatus` derivation
+    /// in AppState so the menubar matches the dock and panel exactly.
+    /// AppState combines model-server lifecycle, harness health, and
+    /// chat status into one ordered priority chain.
     private var derivedState: HaloMenubarState {
-        if !state.runtimeStatus.connected { return .offline }
-        if state.chat.status == .thinking { return .thinking }
-        return state.menubarState
+        state.modelStatus.kind
     }
 
     /// Period (seconds) for one full rotation of the dashed arc.
@@ -273,9 +271,15 @@ final class StatusBarController: NSObject, NSWindowDelegate {
     /// registration, so we re-arm after each callback.
     private func observe() {
         withObservationTracking {
+            // Read everything `modelStatus` depends on — adding a
+            // signal here without listing it means the observer never
+            // re-fires when that signal changes (silent-stale UI).
             _ = state.menubarState
             _ = state.runtimeStatus
             _ = state.chat.status
+            _ = state.modelServerState
+            _ = state.endpointMode
+            _ = state.externalEndpointURL
         } onChange: { [weak self] in
             Task { @MainActor in
                 guard let self else { return }

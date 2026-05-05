@@ -219,6 +219,23 @@ final class RuntimeServer {
                 env["MODEL_BASE_URL"] = AppState.shared.resolvedModelBaseURL
             }
         }
+
+        // Catalog metadata for the menubar stats panel — passed at
+        // spawn so the harness's /v1/health can populate sizeBytes /
+        // params / quant / displayName without shelling out to LM
+        // Studio's `lms` CLI (which would auto-launch LM Studio and
+        // block /v1/health for ~30s on cold start).
+        //
+        // Only set in bundled mode (external mode has no catalog
+        // entry — the user pointed us at their own endpoint).
+        if AppState.shared.endpointMode == .bundled,
+           let id = AppState.shared.selectedModelId,
+           let entry = ModelCatalog.shared.entries.first(where: { $0.id == id }) {
+            env["HALO_MODEL_DISPLAY_NAME"] = entry.model.name
+            env["HALO_MODEL_PARAMS"] = entry.model.params
+            env["HALO_MODEL_QUANT"] = entry.model.quant
+            env["HALO_MODEL_SIZE_BYTES"] = String(entry.model.sizeBytes)
+        }
         p.environment = env
 
         let outPipe = Pipe()

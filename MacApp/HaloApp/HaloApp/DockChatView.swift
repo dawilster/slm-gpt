@@ -62,13 +62,18 @@ struct DockChatView: View {
     }
 
     private var readyStrip: some View {
-        HStack(spacing: 10) {
-            StatusDot(color: runtimeStatus.connected ? Color.haloAccent : Color.haloFgFaint)
-            Text(runtimeStatus.connected ? "Ready" : "Offline")
+        let status = state.modelStatus
+        return HStack(spacing: 10) {
+            StatusDot(color: dotColor(for: status.kind))
+            Text(status.headline)
                 .foregroundStyle(Color.haloFg)
             VRule()
+            // Always show the model name + ctx hint when we have one,
+            // even mid-load — orients the user about which model the
+            // status is referring to.
             Text(runtimeStatus.modelLabel)
                 .font(.haloMono(11)).foregroundStyle(Color.haloFgDim)
+                .lineLimit(1).truncationMode(.middle)
             if let ctx = runtimeStatus.contextHint {
                 Text("· \(ctx)")
                     .font(.haloMono(10.5)).foregroundStyle(Color.haloFgFaint)
@@ -81,6 +86,17 @@ struct DockChatView: View {
         .padding(.top, 10).padding(.bottom, 8)
         .overlay(alignment: .bottom) {
             Rectangle().fill(Color.white.opacity(0.05)).frame(height: 0.5)
+        }
+    }
+
+    /// Map the unified status kind to a dot color. Centralised here so
+    /// the dock matches the menubar without each surface re-deriving.
+    private func dotColor(for kind: HaloMenubarState) -> Color {
+        switch kind {
+        case .error:                       return Color(red: 0.92, green: 0.43, blue: 0.40)
+        case .offline:                     return Color.haloFgFaint
+        case .loading, .thinking:          return Color.haloAccent.opacity(0.7)
+        case .listening, .idle:            return Color.haloAccent
         }
     }
 
@@ -138,10 +154,17 @@ struct DockChatView: View {
             }
             .padding(.horizontal, 12)
 
-            if !runtimeStatus.connected {
-                Text("Runtime daemon offline · run `bun run server`")
+            // Surface a one-liner explanation when the model isn't ready
+            // — covers boot, model swap, crash, and external-endpoint
+            // unreachable. Uses the centralized derivation so the line
+            // matches the dock's status strip exactly.
+            if let detail = state.modelStatus.detail,
+               state.modelStatus.kind != .idle {
+                Text(detail)
                     .font(.haloMono(10.5))
                     .foregroundStyle(Color.haloFgFaint)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 16)
             }
         }
         .frame(maxWidth: .infinity, alignment: .center)

@@ -101,18 +101,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private var healthTimer: Timer?
+    private var healthProbeTask: Task<Void, Never>?
 
+    /// Poll `/v1/health` every 3s and write the result into AppState.
+    /// Implemented as a Task.sleep loop instead of a `Timer` because the
+    /// previous Timer-based version mysteriously stopped firing after a
+    /// couple of ticks (timer block fired once at boot, once ~20s later,
+    /// then nothing — never reproduced the cause). The async loop has
+    /// fewer moving parts: cancel by setting the task to nil (or
+    /// stopping the app), nothing else can invalidate it.
     private func startHealthProbe() {
-        Task { await self.probeOnce() }
-        // .common mode → fires through menu tracking. The default mode pauses
-        // while the menubar popover is open, which is exactly when the user
-        // is most likely to look at the connection state.
-        let timer = Timer(timeInterval: 3.0, repeats: true) { _ in
-            Task { @MainActor in await AppDelegate.shared?.probeOnce() }
+        healthProbeTask?.cancel()
+        healthProbeTask = Task { @MainActor in
+            while !Task.isCancelled {
+                await self.probeOnce()
+                // Catch cancellation cleanly so this task exits when the
+                // app quits — try? swallows the CancellationError from
+                // sleep, the loop then sees Task.isCancelled and breaks.
+                try? await Task.sleep(for: .seconds(3))
+            }
         }
-        RunLoop.main.add(timer, forMode: .common)
-        healthTimer = timer
     }
 
     @MainActor
@@ -130,12 +138,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 paramsString: h.paramsString
             )
             if AppState.shared.runtimeStatus != next {
+                log.info("probe → connected=\(next.connected, privacy: .public) model=\(next.modelLabel, privacy: .public)")
                 AppState.shared.runtimeStatus = next
             }
         } catch {
-            // Always set on transition to offline — prior code only set it
-            // when previously connected, which was correct but subtle.
-            if AppState.shared.runtimeStatus.connected {
+            // Write `.offline` on every transition (Equatable check
+            // suppresses redundant assignments). The earlier "only
+            // when previously connected" guard was symmetric to this
+            // and looked equivalent — but combined with a Timer that
+            // mysteriously stopped firing, the result was that a
+            // single failed probe at boot left us stuck at .offline
+            // forever even though the harness came up healthy 5s
+            // later. Writing unconditionally on transition would
+            // have surfaced "still offline" each tick, which is what
+            // we want: probe-based state, not edge-triggered.
+            if AppState.shared.runtimeStatus != .offline {
+                log.info("probe → offline: \(error.localizedDescription, privacy: .public)")
                 AppState.shared.runtimeStatus = .offline
             }
         }
@@ -229,12 +247,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// User picked a different bundled model from Settings. Stop the
-    /// current llama-server, start it with the new model. Harness
-    /// stays up — its next request reconnects automatically since
-    /// MODEL_BASE_URL hasn't changed.
+    /// current model server, start it with the new model. Then bounce
+    /// the harness too — it caches HALO_MODEL_* envs from spawn time
+    /// for /v1/health's menubar-stats fields, so a model swap needs a
+    /// harness restart to refresh those (the chat path itself wouldn't
+    /// need it — MODEL_BASE_URL is unchanged — but the menubar would
+    /// otherwise keep showing the old model's params/size).
     func applySelectedModelChange() {
         guard AppState.shared.endpointMode == .bundled else { return }
-        Task { await self.startBundledModelIfPossible() }
+        Task {
+            await self.startBundledModelIfPossible()
+            await RuntimeServer.shared.restart()
+        }
     }
 
     // MARK: Hotkey

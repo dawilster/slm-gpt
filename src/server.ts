@@ -136,6 +136,48 @@ let requestCounter = 0;
 // `lms` CLI does — `lms ps --json` returns a per-model object with
 // `sizeBytes`, `paramsString`, and friends. We shell out, cache the
 // result for a few seconds, and serve the merged shape on /v1/health.
+//
+// **Disabled by default.** Two reasons:
+//   1. Invoking the `lms` binary triggers macOS to auto-launch LM Studio
+//      (LM Studio registers a launch agent that wakes the GUI on `lms`
+//      use). That's correct for someone using LM Studio as their model
+//      backend — wrong for someone using our bundled server, who'd see
+//      LM Studio pop up every time the Mac app boots.
+//   2. `lms ps` is an IPC call to LM Studio. While LM Studio is cold-
+//      starting (~30s), the call blocks. /v1/health then blocks, the
+//      Mac app's URLSession probe times out at 60s, and the menubar
+//      flips to "Offline" even though chat works fine.
+//
+// Opt back in with `HALO_USE_LMS=1` if you actually use LM Studio. In
+// bundled mode (the Mac app's default), size/params/quant come from
+// HALO_MODEL_* env vars the Mac app sets from the catalog manifest —
+// see the boot-time read of MODEL_META below.
+const LMS_ENABLED = process.env.HALO_USE_LMS === "1";
+
+// ─── Catalog metadata from spawn env ─────────────────────
+//
+// In bundled mode the Mac app spawns the harness with model metadata
+// pulled straight from catalog.json — size in bytes, params string
+// ("1.7B"), quant ("4-bit MLX"), display name. We surface these on
+// /v1/health so the menubar's Speed/RAM/Context block populates
+// without needing the lms probe.
+//
+// Empty/missing → null on the wire. The Mac app already gracefully
+// renders "—" for nulls.
+type ModelMeta = {
+  displayName: string | null;
+  paramsString: string | null;
+  quantization: string | null;
+  sizeBytes: number | null;
+};
+const MODEL_META: ModelMeta = {
+  displayName: process.env.HALO_MODEL_DISPLAY_NAME || null,
+  paramsString: process.env.HALO_MODEL_PARAMS || null,
+  quantization: process.env.HALO_MODEL_QUANT || null,
+  sizeBytes: process.env.HALO_MODEL_SIZE_BYTES
+    ? Number(process.env.HALO_MODEL_SIZE_BYTES) || null
+    : null,
+};
 
 type LoadedModelInfo = {
   identifier: string;       // matches the OpenAI-compat model id
@@ -169,6 +211,10 @@ function resolveLmsBin(): string {
 }
 
 async function probeLoadedModels(): Promise<LoadedModelInfo[]> {
+  // Disabled by default — see LMS_ENABLED comment above for why.
+  // In bundled mode the menubar stats come from MODEL_META instead.
+  if (!LMS_ENABLED) return [];
+
   const now = Date.now();
   if (lmsCache && now - lmsCache.at < LMS_CACHE_TTL_MS) return lmsCache.data;
 
@@ -541,11 +587,14 @@ const server = Bun.serve({
 
     // GET /v1/health
     if (req.method === "GET" && url.pathname === "/v1/health") {
+      // probeLoadedModels short-circuits to [] unless HALO_USE_LMS=1.
+      // In bundled mode (the default), MODEL_META populates the
+      // size/params/quant fields; lms isn't touched, so LM Studio
+      // doesn't get poked into life on every probe.
       const loaded = await probeLoadedModels();
       const me = findLoadedModel(modelId, loaded);
-      // contextLimit: prefer the live `lms ps` value (reflects the loaded
-      // ctx, which the user can change via LM Studio without restarting us),
-      // then fall back to the boot-time HTTP probe.
+      // contextLimit: prefer the live `lms ps` value (when enabled),
+      // then the boot-time HTTP probe (`/api/v0/models`).
       const ctxLimit = me?.contextLength || caps?.contextLimit || null;
       return respond(json({
         ok: true,
@@ -554,10 +603,10 @@ const server = Bun.serve({
         contextLimit: ctxLimit,
         embeddings: embeddingModelId ?? null,
         liveSessions: liveAssistants.size,
-        modelDisplay: me?.displayName ?? null,
-        quantization: me?.quantization ?? null,
-        paramsString: me?.paramsString ?? null,
-        sizeBytes: me?.sizeBytes ?? null,
+        modelDisplay: me?.displayName ?? MODEL_META.displayName,
+        quantization: me?.quantization ?? MODEL_META.quantization,
+        paramsString: me?.paramsString ?? MODEL_META.paramsString,
+        sizeBytes: me?.sizeBytes ?? MODEL_META.sizeBytes,
         tokensPerSec: avgTps(),
       }));
     }

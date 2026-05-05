@@ -8,9 +8,13 @@ __pycache__/
 # Compiled by scripts/build-runtime.sh — bundled into the Mac app at build time.
 /halo-runtime
 
-# Fetched by scripts/fetch-swiftlm.sh — SwiftLM binary + mlx.metallib
-# bundled into the Mac app's Resources/swiftlm-runtime/.
-/swiftlm-runtime/
+# Built by scripts/fetch-python-mlx.sh — relocatable Python + mlx-lm
+# + fastapi, bundled into the Mac app's Resources/python-runtime/.
+# ~363MB, regenerable, never committed. Documentation for what's
+# inside lives in scripts/python-runtime.md.
+/python-runtime/
+
+# Cached download tarballs (Python interpreter, etc.).
 /vendor/
 
 # Bun build transients

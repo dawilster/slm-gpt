@@ -3,7 +3,7 @@ import os
 
 private let log = Logger(subsystem: "halo.runtime", category: "modelserver")
 
-/// State of the bundled llama-server (inference) process. Distinct from
+/// State of the bundled MLX inference server process. Distinct from
 /// RuntimeProcessState — that's about the harness, this is about the
 /// model server underneath it. The Mac app spawns both.
 enum ModelServerState: Equatable, Sendable {
@@ -29,23 +29,34 @@ enum ModelServerState: Equatable, Sendable {
     }
 }
 
-/// Owns the lifecycle of the bundled `SwiftLM` process — the second
+/// Owns the lifecycle of the bundled MLX inference server — the second
 /// instance of the orchestrator pattern (design.md §3.8). The Mac app
 /// spawns this *first*, waits for it to come up, then spawns the
 /// harness with `MODEL_BASE_URL` pointed at it.
 ///
-/// SwiftLM is a native MLX inference server (Swift, no Python). It
-/// listens on :1235 (vs LM Studio's conventional :1234). Spawned with
+/// The server itself is `python-runtime/serve.py` (FastAPI shim around
+/// mlx-lm + mlx-vlm), launched via the `python-supervised.sh` wrapper.
+/// It listens on :1235 (vs LM Studio's conventional :1234) and exposes
+/// the OpenAI-compat surface the harness already speaks. Spawned with
 /// `--model <local-mlx-dir> --port 1235`. We use a local directory
 /// path rather than a HuggingFace ID so the user's selected catalog
 /// model (downloaded into our own storage with our SHA-pinned
 /// integrity check) is what actually loads.
 ///
+/// Why Python+mlx-lm/mlx-vlm vs SwiftLM: SwiftLM (a native Swift+MLX
+/// server) couldn't load Qwen3.5-2B-6bit because mlx-community's
+/// VLM packaging doesn't match SwiftLM's loader expectations. The
+/// Python ecosystem (what LM Studio uses internally) tracks
+/// bleeding-edge model support — we get every new mlx-community
+/// model "for free" without waiting on SwiftLM updates. Bundle size
+/// went from ~190MB → ~300MB; the trade is worth it. See
+/// design.md decision log 2026-05-05.
+///
 /// Why MLX over llama.cpp/GGUF: design.md §3.8 originally chose
 /// llama-server for portability, but we now target M-series only — so
 /// MLX wins on tok/s (25 vs 20 in our perf eval), keeps parity with
 /// the user's existing mlx-community model collection, and avoids
-/// architecture-support gaps (Qwen3.5 not in llama.cpp b9025).
+/// architecture-support gaps.
 @MainActor
 final class ModelServer {
     static let shared = ModelServer()
@@ -63,7 +74,7 @@ final class ModelServer {
     }
     var onStateChange: ((ModelServerState) -> Void)?
 
-    /// Where stdout/stderr from llama-server gets appended.
+    /// Where stdout/stderr from the Python MLX server gets appended.
     let logFileURL: URL
 
     private var process: Process?
@@ -84,6 +95,9 @@ final class ModelServer {
             logsDir = URL(fileURLWithPath: "/tmp")
         }
         try? FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
+        // Filename retains "llama-server" for log-archive continuity —
+        // older builds wrote here, and the contents are still "the
+        // bundled inference server", just now Python+MLX.
         self.logFileURL = logsDir.appendingPathComponent("llama-server.log")
     }
 
@@ -92,9 +106,10 @@ final class ModelServer {
 
     // MARK: - Public lifecycle
 
-    /// Spawn llama-server pointed at the GGUF for `modelId`. Idempotent
-    /// — calling with the same modelId while already running is a no-op.
-    /// Calling with a different modelId stops the current one first.
+    /// Spawn the Python MLX server pointed at the model directory for
+    /// `modelId`. Idempotent — calling with the same modelId while
+    /// already running is a no-op. Calling with a different modelId
+    /// stops the current one first.
     func start(modelId: String) async {
         if case .running(_, let current) = state, current == modelId { return }
         if case .starting(let current) = state, current == modelId { return }
@@ -112,7 +127,7 @@ final class ModelServer {
             return
         }
         guard let binary = locateBinary() else {
-            state = .crashed(reason: "llama-server binary not found in bundle (run scripts/build-llama-server.sh)")
+            state = .crashed(reason: "python-runtime not found in bundle (run scripts/fetch-python-mlx.sh)")
             return
         }
 
@@ -137,25 +152,23 @@ final class ModelServer {
         // context budget is ~16GB of headroom — fine on M-series with
         // mmap'd weights but we cap at 8K on 8GB Macs to leave room for
         // user apps. Surfaces as a load-time setting in v8.5+.
+        //
+        // No --vision flag needed: serve.py auto-detects VLMs by
+        // inspecting config.json for a `vision_config` block and
+        // routes through mlx-vlm vs mlx-lm accordingly.
         let contextLimit = ramAdjustedContext(for: entry.model)
-        var args = [
+        p.arguments = [
             "--model", entry.installedURL.path,  // local MLX directory
             "--port", String(port),
             "--host", "127.0.0.1",
             "--ctx-size", String(contextLimit),
         ]
-        // VLM (vision-language) models have weights namespaced under
-        // `language_model.*` rather than `model.*`. SwiftLM needs the
-        // `--vision` flag to route them correctly — without it we get
-        // "Key language_model.model.embed_tokens.weight not found".
-        if entry.model.isVisionModel == true {
-            args.append("--vision")
-        }
-        p.arguments = args
         var env = ProcessInfo.processInfo.environment
-        // Death-pact: the supervisor wrapper polls this pid and SIGKILLs
-        // SwiftLM when the Mac app dies. Without it the model server
-        // orphans to launchd holding ~2-3GB of RAM with the model loaded.
+        // Death-pact: the supervisor wrapper polls this pid and
+        // SIGKILLs the python child when the Mac app dies. serve.py
+        // also has its own in-process watchdog as belt-and-braces.
+        // Without these, the model server orphans to launchd holding
+        // ~3-4GB of RAM with the model loaded.
         env["HALO_PARENT_PID"] = String(ProcessInfo.processInfo.processIdentifier)
         p.environment = env
 
@@ -229,7 +242,7 @@ final class ModelServer {
 
     private func handleTermination(reason: Process.TerminationReason, status: Int32) {
         let why = "\(reason == .uncaughtSignal ? "signal" : "exit") \(status)"
-        log.error("llama-server exited: \(why, privacy: .public)")
+        log.error("python MLX server exited: \(why, privacy: .public)")
 
         stdoutPipe?.fileHandleForReading.readabilityHandler = nil
         stderrPipe?.fileHandleForReading.readabilityHandler = nil
@@ -274,28 +287,29 @@ final class ModelServer {
     }
 
     private func locateBinary() -> URL? {
-        // We invoke the *supervisor* shell wrapper, not SwiftLM directly
-        // — the wrapper handles parent-pid death-pact and execs SwiftLM
-        // from the same dir (mlx.metallib must sit alongside the
-        // binary, hence the cd in the wrapper).
-        let wrapperName = "swiftlm-supervised.sh"
+        // We invoke the *supervisor* shell wrapper, not python directly
+        // — the wrapper handles parent-pid death-pact, sets up the
+        // python invocation (`python3 serve.py ...`), and forwards args.
+        let wrapperName = "python-supervised.sh"
 
-        if let res = Bundle.main.resourceURL?.appendingPathComponent("swiftlm-runtime/\(wrapperName)"),
+        // Production: the wrapper lives inside the bundled
+        // python-runtime/ dir, ditto'd into Resources/ by Xcode.
+        if let res = Bundle.main.resourceURL?.appendingPathComponent("python-runtime/\(wrapperName)"),
            FileManager.default.isExecutableFile(atPath: res.path) {
             return res
         }
-        // Dev fallback: prebuilt swiftlm-runtime/ at repo root, plus the
-        // wrapper from scripts/. We need both — locate the wrapper (in
-        // scripts/) and copy it next to SwiftLM on first call.
+        // Dev fallback: walk up looking for the repo's python-runtime/
+        // dir. The fetch-python-mlx.sh script puts the wrapper inside
+        // it (alongside bin/python3 and serve.py). If we find the dir
+        // but no wrapper, copy the source-controlled one from scripts/.
         var dir = Bundle.main.bundleURL.deletingLastPathComponent()
         for _ in 0..<10 {
-            let candidate = dir.appendingPathComponent("swiftlm-runtime/\(wrapperName)")
+            let candidate = dir.appendingPathComponent("python-runtime/\(wrapperName)")
             if FileManager.default.isExecutableFile(atPath: candidate.path) {
                 return candidate
             }
-            // Wrapper not yet copied — copy it from scripts/ if both exist.
             let wrapperSrc = dir.appendingPathComponent("scripts/\(wrapperName)")
-            let runtimeDir = dir.appendingPathComponent("swiftlm-runtime")
+            let runtimeDir = dir.appendingPathComponent("python-runtime")
             if FileManager.default.isExecutableFile(atPath: wrapperSrc.path),
                FileManager.default.fileExists(atPath: runtimeDir.path) {
                 let dst = runtimeDir.appendingPathComponent(wrapperName)
@@ -310,19 +324,19 @@ final class ModelServer {
         }
         // Last-resort hardcoded dev path.
         let hardcoded = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("workspace/ollama/swiftlm-runtime/\(wrapperName)")
+            .appendingPathComponent("workspace/ollama/python-runtime/\(wrapperName)")
         if FileManager.default.isExecutableFile(atPath: hardcoded.path) {
             return hardcoded
         }
         return nil
     }
 
-    /// True only when llama-server is fully loaded and ready to accept
-    /// inference. /health returns 503 + "Loading model" while the GGUF
-    /// is mmap'ing (~1-10s depending on model size), then 200 + "ok".
-    /// /v1/models would 200 as soon as the server binds the port — too
-    /// lenient for our boot-order: halo-runtime would race the model
-    /// load and its first discovery probe would hit 503.
+    /// True only when serve.py is fully loaded and ready to accept
+    /// inference. serve.py loads the model synchronously *before*
+    /// uvicorn binds the port, so by the time /health responds 200
+    /// at all, generation is ready. /v1/models would also work but
+    /// we use /health to keep the port-bind-vs-loaded distinction
+    /// crisp if the loader behaviour ever changes.
     private func healthOK() async -> Bool {
         guard let url = URL(string: "http://127.0.0.1:\(port)/health") else { return false }
         var req = URLRequest(url: url)

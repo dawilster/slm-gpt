@@ -1,11 +1,24 @@
 {
-  "$comment": "Vetted MLX model catalog. Each entry pins a HuggingFace repo + revision (commit SHA) — the 'vetting' is that we picked these models, tested them on our reference hardware, and pinned the exact repo state. New revisions = new app release. See design.md §3.8. Note: Qwen3.5-2B-6bit on mlx-community is the VLM variant and SwiftLM b644's vision-tower expectations don't match its packaging — dropped until SwiftLM catches up or a non-VLM Qwen3.5-2B is published.",
-  "version": 2,
+  "$comment": "Vetted MLX model catalog. Each entry pins a HuggingFace repo + revision (commit SHA) — the 'vetting' is that we picked these models, tested them on our reference hardware, and pinned the exact repo state. New revisions = new app release. See design.md §3.8. The runtime is Python+mlx-lm/mlx-vlm (serve.py); VLMs are auto-detected from config.json so the catalog needs no isVisionModel flag.",
+  "version": 3,
   "models": [
+    {
+      "id": "qwen3.5-2b-6bit",
+      "name": "Qwen 3.5 · 2B (6-bit MLX)",
+      "tagline": "Recommended. Multimodal, sharp tool calling, fits 8GB comfortably.",
+      "params": "2B",
+      "quant": "6-bit",
+      "context": 32768,
+      "huggingfaceRepo": "mlx-community/Qwen3.5-2B-6bit",
+      "huggingfaceRevision": "ba2bcf03dd5b502646de7e32b003cf538f2ca4d6",
+      "sizeBytes": 2219401217,
+      "ramRequiredMB": 2800,
+      "minRamGB": 8
+    },
     {
       "id": "qwen3-1.7b-6bit",
       "name": "Qwen 3 · 1.7B (6-bit MLX)",
-      "tagline": "Recommended. Sharp tool calling, fits 8GB comfortably.",
+      "tagline": "Smaller text-only alternative. Fast on 8GB.",
       "params": "1.7B",
       "quant": "6-bit",
       "context": 32768,

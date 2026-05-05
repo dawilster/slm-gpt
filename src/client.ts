@@ -172,7 +172,8 @@ export class OpenAICompatClient implements ModelClient {
     // as a fallback.
     const reasoningField = (message as any)?.reasoning_content;
     const thinking = typeof reasoningField === "string" ? reasoningField : "";
-    const reply = options.enableThinking ? stripThinking(rawReply) : rawReply;
+    // Always strip — see streaming path for rationale.
+    const reply = stripThinking(rawReply);
     const rawToolCalls = message?.tool_calls;
     const toolCalls: ToolCallReq[] | undefined = rawToolCalls
       ?.filter((tc): tc is typeof tc & { function: { name: string; arguments: string } } =>
@@ -284,7 +285,10 @@ export class OpenAICompatClient implements ModelClient {
       });
     }
 
-    const cleanReply = options.enableThinking ? stripThinking(reply) : reply;
+    // Always strip — defensive against the model emitting `<think>`
+    // even when we asked the template to suppress it. No-op when no
+    // tags present. Same belt-and-braces as the non-streaming path.
+    const cleanReply = stripThinking(reply);
 
     return {
       reply: cleanReply,
